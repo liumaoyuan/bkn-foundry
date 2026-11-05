@@ -31,7 +31,6 @@ import (
 const ctxHydraBrowserPublicURL = "hydra_browser_public_url"
 
 func registerAuth(r *gin.Engine, p *auth.Provider, h *auth.HydraAdmin, accessStore accesslog.Recorder, browserPublicURL string) {
-	r.GET(openBKNLogoPath, serveOpenBKNLogo)
 	r.GET(loginBackgroundPath, serveLoginBackground)
 	r.GET("/login", func(c *gin.Context) { showLogin(c, h) })
 	r.POST("/login", func(c *gin.Context) {
@@ -61,7 +60,7 @@ func registerAuth(r *gin.Engine, p *auth.Provider, h *auth.HydraAdmin, accessSto
 
 // pageCSS is the shared light shell (centered panel), following the BKN Studio
 // console design language: #2563eb primary, light product backdrop, white
-// 20px-radius panel, AntD-like 8px fields/buttons, and the OpenBKN logo.
+// 20px-radius panel, AntD-like 8px fields/buttons, and the product wordmark.
 const pageCSS = `<style>
 :root{color-scheme:light}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -81,7 +80,10 @@ body:before{content:"";position:fixed;inset:0;z-index:-2;background-image:
 .locale-switch a.active{color:#2563eb;font-weight:600}
 .locale-switch a:focus-visible{outline:2px solid rgba(37,99,235,.35);outline-offset:2px}
 .brand{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px}
-.brand-logo{display:block;width:272px;height:94px;object-fit:contain}
+.brand-wordmark{display:inline-flex;align-items:center;min-height:40px;
+  background:linear-gradient(92deg,#1e3a8a 0%,#2563eb 58%,#3b82f6 100%);
+  background-clip:text;color:transparent;font-size:20px;font-weight:700;
+  letter-spacing:.035em;line-height:1.25;white-space:nowrap;-webkit-background-clip:text}
 .brand-mark{position:relative;width:40px;height:40px;border-radius:14px;
   background:linear-gradient(145deg,rgba(37,99,235,.16),rgba(37,99,235,.04)),#fff;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 10px 24px rgba(37,99,235,.14)}
@@ -117,22 +119,13 @@ form{width:min(400px,100%);margin:0 auto}
 @media (max-width:640px){body:before{background-position:60% center}.card{padding:36px 24px}.locale-switch{right:18px}}
 </style>`
 
-//go:embed assets/openbkn-logo.svg
-var openBKNLogoSVG []byte
-
 //go:embed assets/login-background.jpg
 var loginBackgroundJPG []byte
 
 const (
-	openBKNLogoPath     = "/login/assets/openbkn-logo-5175503c14ed.svg"
-	openBKNLogoETag     = `"5175503c14ed4a59773aa337b07e333a632285468bba53b8bbe594ff8a5afc48"`
 	loginBackgroundPath = "/login/assets/login-background-2c76122b3960.jpg"
 	loginBackgroundETag = `"2c76122b39608ab1be202d1f3009ed26a09d8a0e721d4a20b297bbb449a6bb91"`
 )
-
-func serveOpenBKNLogo(c *gin.Context) {
-	serveCacheableAuthAsset(c, "image/svg+xml; charset=utf-8", openBKNLogoETag, openBKNLogoSVG)
-}
 
 func serveLoginBackground(c *gin.Context) {
 	serveCacheableAuthAsset(c, "image/jpeg", loginBackgroundETag, loginBackgroundJPG)
@@ -154,7 +147,7 @@ func serveCacheableAuthAsset(c *gin.Context, contentType, etag string, body []by
 // platform-level login) carry BKN Foundry.
 func brand(name string) string {
 	if name == "BKN Studio" {
-		return `<div class="brand"><img class="brand-logo" src="` + openBKNLogoPath + `" alt="OpenBKN" width="272" height="94"></div>`
+		return `<div class="brand"><span class="brand-wordmark">九格多源本体构建系统</span></div>`
 	}
 	return `<div class="brand"><span class="brand-mark"><i class="core"></i><i class="orbit orbit-l"></i><i class="orbit orbit-r"></i></span><strong>` + name + `</strong></div>`
 }

@@ -20,58 +20,6 @@ import (
 	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
-func TestOpenBKNLogoAssetIsCacheable(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	router := gin.New()
-	hydra := auth.NewHydraAdmin("http://hydra.invalid")
-	registerAuth(router, auth.NewProvider(nil, hydra, nil), hydra, nil, "")
-
-	request := httptest.NewRequest(http.MethodGet, openBKNLogoPath, nil)
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
-	}
-	if got := response.Header().Get("Content-Type"); got != "image/svg+xml; charset=utf-8" {
-		t.Errorf("Content-Type = %q, want image/svg+xml; charset=utf-8", got)
-	}
-	if got := response.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
-		t.Errorf("Cache-Control = %q, want long-lived immutable caching", got)
-	}
-	if got := response.Header().Get("ETag"); got != openBKNLogoETag {
-		t.Errorf("ETag = %q, want %q", got, openBKNLogoETag)
-	}
-	digest := fmt.Sprintf("%x", sha256.Sum256(openBKNLogoSVG))
-	if openBKNLogoETag != `"`+digest+`"` {
-		t.Errorf("logo ETag does not match embedded SVG digest %q", digest)
-	}
-	if !strings.Contains(openBKNLogoPath, digest[:12]) {
-		t.Errorf("logo path %q does not contain content fingerprint %q", openBKNLogoPath, digest[:12])
-	}
-	if !bytes.Equal(response.Body.Bytes(), openBKNLogoSVG) {
-		t.Error("response body does not match the embedded OpenBKN logo")
-	}
-	for _, forbidden := range []string{"<script", "<image", "data:image", "foreignObject"} {
-		if bytes.Contains(response.Body.Bytes(), []byte(forbidden)) {
-			t.Errorf("SVG contains forbidden content %q", forbidden)
-		}
-	}
-
-	request = httptest.NewRequest(http.MethodGet, openBKNLogoPath, nil)
-	request.Header.Set("If-None-Match", openBKNLogoETag)
-	response = httptest.NewRecorder()
-	router.ServeHTTP(response, request)
-
-	if response.Code != http.StatusNotModified {
-		t.Fatalf("conditional request status = %d, want %d", response.Code, http.StatusNotModified)
-	}
-	if response.Body.Len() != 0 {
-		t.Errorf("304 response body size = %d, want 0", response.Body.Len())
-	}
-}
-
 func TestLoginBackgroundAssetIsCacheable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -119,7 +67,7 @@ func TestLoginBackgroundAssetIsCacheable(t *testing.T) {
 	}
 }
 
-func TestLoginPageReferencesExternalAssets(t *testing.T) {
+func TestLoginPageUsesStudioWordmarkAndExternalBackground(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	router := gin.New()
@@ -136,13 +84,15 @@ func TestLoginPageReferencesExternalAssets(t *testing.T) {
 	body := response.Body.String()
 	for _, expected := range []string{
 		`url("` + loginBackgroundPath + `")`,
-		`src="` + openBKNLogoPath + `"`,
-		`width="272"`,
-		`height="94"`,
+		`class="brand-wordmark"`,
+		`九格多源本体构建系统`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("body does not contain %q", expected)
 		}
+	}
+	if strings.Contains(body, "openbkn-logo") {
+		t.Error("login page still references the OpenBKN logo image")
 	}
 	if strings.Contains(body, "data:image") {
 		t.Error("login page still embeds the logo as a data URI")
