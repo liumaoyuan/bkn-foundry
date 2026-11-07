@@ -9,7 +9,9 @@ ENV GOPROXY=${GOPROXY}
 WORKDIR /app
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
 COPY . .
 
@@ -19,8 +21,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o oss-gateway main.go
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# Ubuntu apt mirror override (host only, e.g. mirrors.aliyun.com); empty keeps the upstream sources.
+ARG APT_MIRROR=
+
 # Install runtime dependencies with apt-get on Ubuntu.
-RUN apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        if [ -f "$f" ]; then \
+          sed -i "s|http://archive.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g" "$f"; \
+        fi; \
+      done; \
+    fi; \
+    apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/
 

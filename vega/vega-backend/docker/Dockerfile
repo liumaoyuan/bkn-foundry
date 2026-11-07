@@ -18,7 +18,9 @@ ARG GOPROXY_URL="https://proxy.golang.org,direct"
 
 ENV GOPROXY=${GOPROXY_URL}
 
-RUN set -ex; \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -ex; \
     go mod download -x; \
     export flags="-X 'github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/version.ServerVersion=${SERVER_VERSION}'"; \
     CGO_ENABLED=1 go build -ldflags "-s -w $flags" -o ./bin/vega-backend-server ./cmd/vega-backend;

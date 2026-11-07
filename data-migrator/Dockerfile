@@ -10,15 +10,34 @@ ARG BASE_IMAGE=ubuntu:24.04
 
 FROM ${BASE_IMAGE}
 
+# PyPI index override; keeps the default upstream behavior when not passed.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+# Ubuntu apt mirror override (host only, e.g. mirrors.aliyun.com); empty keeps the upstream sources.
+ARG APT_MIRROR=
+
 WORKDIR /app
 
 COPY data-migrator/server ./server
 
 # git is required for pip to install the git-sourced RDS driver in requirements.txt.
-RUN set -ex; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -ex; \
+    if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        if [ -f "$f" ]; then \
+          sed -i "s|http://archive.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g" "$f"; \
+        fi; \
+      done; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends git python3-pip ca-certificates; \
-    pip3 install --no-cache-dir -r server/requirements.txt --break-system-packages; \
+    i=0; \
+    until pip3 install --timeout 120 --retries 10 -i ${PIP_INDEX_URL} \
+        -r server/requirements.txt --break-system-packages; do \
+      i=$((i+1)); \
+      if [ "$i" -ge 3 ]; then echo "pip install failed after $i attempts"; exit 1; fi; \
+      echo "pip install failed (attempt $i), retrying..."; sleep 5; \
+    done; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 

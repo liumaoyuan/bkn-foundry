@@ -10,7 +10,9 @@ ENV GOPROXY=${GOPROXY_URL}
 
 COPY adp/context-loader/agent-retrieval /workspace/adp/context-loader/agent-retrieval
 
-RUN set -ex; \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -ex; \
     cd /workspace/adp/context-loader/agent-retrieval; \
     go mod download; \
     go build -ldflags '-s -w -checklinkname=0' -o /out/agent-retrieval ./server/main.go

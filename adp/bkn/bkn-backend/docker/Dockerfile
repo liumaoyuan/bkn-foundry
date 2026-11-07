@@ -16,7 +16,9 @@ ARG GOPROXY_URL="https://proxy.golang.org,direct"
 
 ENV GOPROXY=${GOPROXY_URL}
 
-RUN set -ex; \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -ex; \
     cd /workspace/adp/bkn/bkn-backend/server; \
     go mod download -x; \
     export flags="-X 'github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/version.ServerVersion=${SERVER_VERSION}'"; \

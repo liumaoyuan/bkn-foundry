@@ -5,10 +5,16 @@
 
 FROM golang:1.26.9 AS builder
 
+# Go module proxy override; keeps the default upstream behavior when not passed.
+ARG GOPROXY_URL="https://proxy.golang.org,direct"
+ENV GOPROXY=${GOPROXY_URL}
+
 WORKDIR /workspace
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
 COPY . .
 

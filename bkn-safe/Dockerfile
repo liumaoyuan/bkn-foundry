@@ -16,7 +16,9 @@ ARG GOPROXY_URL="https://proxy.golang.org,direct"
 ENV GOPROXY=${GOPROXY_URL}
 # CGO disabled: openbkn-rds driver + glebarez (pure-Go) sqlite need no cgo, so the
 # binary is static and runs on a minimal base.
-RUN set -ex; \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -ex; \
     cd /go/src; \
     go mod download -x; \
     CGO_ENABLED=0 go build -ldflags "-s -w" -o ./bin/bkn-safe .
