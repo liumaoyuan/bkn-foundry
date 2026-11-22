@@ -1,0 +1,71 @@
+replicaCount: 1
+
+image:
+  registry: ghcr.io/openbkn-ai
+  repository: data-ingestion
+  tag: "__VERSION__"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+mcp:
+  enabled: true
+  port: 8010
+  path: /mcp
+  resourceURL: http://data-ingestion-mcp:8010
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "500M"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/rewrite-target: /api/$2
+  path: /api/data-ingestion(/|$)(.*)
+  pathType: ImplementationSpecific
+
+database:
+  host: mariadb
+  port: 3306
+  name: data_ingestion
+  user: jiuge-bkn
+  existingSecret: jiuge-bkn-db
+  passwordKey: password
+
+objectStorage:
+  bucket: data-ingestion
+  prefix: data-ingestion
+  existingSecret: minio-default
+  endpointKey: endpoint
+  accessKeyKey: access-key
+  secretKeyKey: secret-key
+  region: us-east-1
+
+auth:
+  hydraAdminURL: http://bkn-safe-hydra-admin:4445
+  bknSafeURL: http://bkn-safe:3000
+  publicIssuerURL: https://openbkn.example.com
+  existingSecret: data-ingestion-secrets
+  internalTokenKey: internal-token
+  dataSourceSecretKey: data-source-secret
+
+scheduler:
+  enabled: true
+  tickSeconds: 5
+  maxFilesPerRun: 20
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClassName: ""
+  existingClaim: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 2
+    memory: 4Gi

@@ -11,8 +11,8 @@ TPL_DIR      := $(API_DIR)/_templates
 # 发布的模块及其展示顺序。手写列表而非目录通配：通配按目录名排序，出来的是
 # "bkn-agent 排在 bkn 前面" 这种字典序巧合，且无法把某个模块暂时撤下发布面。
 # 顺序即站点首页的卡片分组顺序，改这里就改了线上顺序。
-MODULES      := bkn bkn-safe-admin context-loader ontology-query vega execution-factory mf-model-manager mf-model-api \
-                agent-observability bkn-agent
+MODULES      := bkn bkn-safe-admin context-loader ontology-query vega execution-factory data-ingestion \
+                mf-model-manager mf-model-api agent-observability bkn-agent
 # 暂不发布的模块目录（YAML 保留在仓库，只是不进站点、不参与 lint）：
 #   bkn-safe      Self-service reads and cluster-internal authz / managed-proxy contracts are not published as general integration APIs
 #   observability 只有 observability.json，没有可发布的 YAML，渲染出来是空分组

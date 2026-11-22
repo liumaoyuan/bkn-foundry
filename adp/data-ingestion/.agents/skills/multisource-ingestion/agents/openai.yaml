@@ -1,0 +1,3 @@
+interface:
+  display_name: "多源数据入库"
+  short_description: "通过 MCP 预览、清洗、入库并核验多源文件"

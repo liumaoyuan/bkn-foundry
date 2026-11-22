@@ -1,0 +1,1870 @@
+openapi: 3.1.0
+info:
+  title: 九格多源数据入库系统
+  description: 多源数据接入、清洗、入库和过程追踪 API
+  version: 0.1.0
+paths:
+  /api/data-ingestion/agent/status:
+    get:
+      tags:
+      - agent
+      summary: Read Agent Status
+      operationId: read_agent_status_api_agent_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Read Agent Status Api Agent Status Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/agent/sessions:
+    get:
+      tags:
+      - agent
+      summary: List Agent Sessions
+      operationId: list_agent_sessions_api_agent_sessions_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  additionalProperties: true
+                  type: object
+                type: array
+                title: Response List Agent Sessions Api Agent Sessions Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+    post:
+      tags:
+      - agent
+      summary: Create Agent Session
+      operationId: create_agent_session_api_agent_sessions_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentSessionCreate'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Create Agent Session Api Agent Sessions Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/agent/sessions/{session_id}:
+    get:
+      tags:
+      - agent
+      summary: Read Agent Session
+      operationId: read_agent_session_api_agent_sessions__session_id__get
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Read Agent Session Api Agent Sessions  Session Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - agent
+      summary: Delete Agent Session
+      operationId: delete_agent_session_api_agent_sessions__session_id__delete
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: boolean
+                title: Response Delete Agent Session Api Agent Sessions  Session Id  Delete
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/messages:
+    post:
+      tags:
+      - agent
+      summary: Send Agent Message
+      operationId: send_agent_message_api_agent_sessions__session_id__messages_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentTurnRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Send Agent Message Api Agent Sessions  Session Id  Messages Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/approvals/{approval_id}/approve:
+    post:
+      tags:
+      - agent
+      summary: Approve Agent Tool
+      operationId: approve_agent_tool_api_agent_sessions__session_id__approvals__approval_id__approve_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Approval Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentApprovalRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Approve Agent Tool Api Agent Sessions  Session Id  Approvals  Approval
+                  Id  Approve Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/approvals/{approval_id}/reject:
+    post:
+      tags:
+      - agent
+      summary: Reject Agent Tool
+      operationId: reject_agent_tool_api_agent_sessions__session_id__approvals__approval_id__reject_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Approval Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentApprovalRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Reject Agent Tool Api Agent Sessions  Session Id  Approvals  Approval
+                  Id  Reject Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/memories:
+    post:
+      tags:
+      - agent
+      summary: Create Agent Memory
+      operationId: create_agent_memory_api_agent_sessions__session_id__memories_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentMemoryCreate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Create Agent Memory Api Agent Sessions  Session Id  Memories Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/memories/{memory_id}:
+    delete:
+      tags:
+      - agent
+      summary: Delete Agent Memory
+      operationId: delete_agent_memory_api_agent_sessions__session_id__memories__memory_id__delete
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: memory_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Memory Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: boolean
+                title: Response Delete Agent Memory Api Agent Sessions  Session Id  Memories  Memory Id  Delete
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/auto-scan/status:
+    get:
+      tags:
+      - auto-scan
+      summary: Scheduler Status
+      operationId: scheduler_status_api_auto_scan_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Scheduler Status Api Auto Scan Status Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/auto-scan/jobs:
+    get:
+      tags:
+      - auto-scan
+      summary: List Jobs
+      operationId: list_jobs_api_auto_scan_jobs_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  additionalProperties: true
+                  type: object
+                type: array
+                title: Response List Jobs Api Auto Scan Jobs Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+    post:
+      tags:
+      - auto-scan
+      summary: Create Job
+      operationId: create_job_api_auto_scan_jobs_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutoScanJobCreate'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Create Job Api Auto Scan Jobs Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/auto-scan/jobs/{job_id}:
+    get:
+      tags:
+      - auto-scan
+      summary: Get Job
+      operationId: get_job_api_auto_scan_jobs__job_id__get
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Job Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Get Job Api Auto Scan Jobs  Job Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    put:
+      tags:
+      - auto-scan
+      summary: Update Job
+      operationId: update_job_api_auto_scan_jobs__job_id__put
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Job Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutoScanJobUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Update Job Api Auto Scan Jobs  Job Id  Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - auto-scan
+      summary: Delete Job
+      operationId: delete_job_api_auto_scan_jobs__job_id__delete
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Job Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: boolean
+                title: Response Delete Job Api Auto Scan Jobs  Job Id  Delete
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/auto-scan/jobs/{job_id}/run:
+    post:
+      tags:
+      - auto-scan
+      summary: Run Job Now
+      operationId: run_job_now_api_auto_scan_jobs__job_id__run_post
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Job Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Run Job Now Api Auto Scan Jobs  Job Id  Run Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/spaces:
+    get:
+      tags:
+      - data-spaces
+      summary: Read Data Spaces
+      operationId: read_data_spaces_api_spaces_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/DataSpaceOut'
+                type: array
+                title: Response Read Data Spaces Api Spaces Get
+    post:
+      tags:
+      - data-spaces
+      summary: Create Data Space
+      operationId: create_data_space_api_spaces_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataSpaceCreate'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataSpaceOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/spaces/{space_id}/test:
+    post:
+      tags:
+      - data-spaces
+      summary: Test Data Space
+      operationId: test_data_space_api_spaces__space_id__test_post
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Space Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Test Data Space Api Spaces  Space Id  Test Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/health:
+    get:
+      summary: Health
+      operationId: health_api_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  type: string
+                type: object
+                title: Response Health Api Health Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/storage/info:
+    get:
+      summary: Storage Info
+      operationId: storage_info_api_storage_info_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Storage Info Api Storage Info Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/agent/manifest:
+    get:
+      summary: Agent Manifest
+      operationId: agent_manifest_api_agent_manifest_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Agent Manifest Api Agent Manifest Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/agent/skill:
+    get:
+      summary: Agent Skill
+      operationId: agent_skill_api_agent_skill_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Agent Skill Api Agent Skill Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/overview:
+    get:
+      summary: Overview
+      operationId: overview_api_overview_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Overview Api Overview Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/datasets:
+    get:
+      summary: Datasets
+      operationId: datasets_api_datasets_get
+      parameters:
+      - name: q
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Q
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DatasetOut'
+                title: Response Datasets Api Datasets Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      summary: Create Dataset
+      operationId: create_dataset_api_datasets_post
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/Body_create_dataset_api_datasets_post'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/datasets/{dataset_id}:
+    get:
+      summary: Dataset Detail
+      operationId: dataset_detail_api_datasets__dataset_id__get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/schema:
+    get:
+      summary: Dataset Schema
+      operationId: dataset_schema_api_datasets__dataset_id__schema_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - name: sample_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 500
+          minimum: 1
+          default: 100
+          title: Sample Size
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetSchemaOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/records/changes:
+    get:
+      summary: Dataset Record Changes
+      operationId: dataset_record_changes_api_datasets__dataset_id__records_changes_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 500
+          minimum: 1
+          default: 200
+          title: Limit
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetRecordChangesOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/templates:
+    get:
+      summary: Templates
+      operationId: templates_api_templates_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/TemplateOut'
+                type: array
+                title: Response Templates Api Templates Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/templates/{template_code}:
+    get:
+      summary: Template Detail
+      operationId: template_detail_api_templates__template_code__get
+      parameters:
+      - name: template_code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Template Code
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemplateOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/sources:
+    get:
+      summary: Sources
+      operationId: sources_api_sources_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  additionalProperties: true
+                  type: object
+                type: array
+                title: Response Sources Api Sources Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+    post:
+      summary: Create Source
+      operationId: create_source_api_sources_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataSourceCreate'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Create Source Api Sources Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/sources/{source_id}/test:
+    post:
+      summary: Test Source
+      operationId: test_source_api_sources__source_id__test_post
+      parameters:
+      - name: source_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Source Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Test Source Api Sources  Source Id  Test Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/runs:
+    get:
+      summary: Runs
+      operationId: runs_api_runs_get
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+      - name: dataset_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Dataset Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RunListItem'
+                title: Response Runs Api Runs Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      summary: Create Run
+      operationId: create_run_api_runs_post
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_create_run_api_runs_post'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Create Run Api Runs Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/runs/{run_id}:
+    get:
+      summary: Run Detail
+      operationId: run_detail_api_runs__run_id__get
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Run Detail Api Runs  Run Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/uploads/inspect:
+    post:
+      summary: Inspect Upload
+      operationId: inspect_upload_api_uploads_inspect_post
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_inspect_upload_api_uploads_inspect_post'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectionOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/runs/{run_id}/retry:
+    post:
+      summary: Retry Run
+      operationId: retry_run_api_runs__run_id__retry_post
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Retry Run Api Runs  Run Id  Retry Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/records:
+    get:
+      summary: Dataset Records
+      operationId: dataset_records_api_datasets__dataset_id__records_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - name: page
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+          title: Page
+      - name: page_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 20
+          title: Page Size
+      - name: q
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Q
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Dataset Records Api Datasets  Dataset Id  Records Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/runs/{run_id}/asset:
+    get:
+      summary: Download Source Asset
+      operationId: download_source_asset_api_runs__run_id__asset_get
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    AgentApprovalRequest:
+      properties:
+        reason:
+          type: string
+          title: Reason
+          default: ''
+      type: object
+      title: AgentApprovalRequest
+    AgentMemoryCreate:
+      properties:
+        key:
+          type: string
+          maxLength: 160
+          minLength: 1
+          title: Key
+        value:
+          type: string
+          maxLength: 10000
+          minLength: 1
+          title: Value
+      type: object
+      required:
+      - key
+      - value
+      title: AgentMemoryCreate
+    AgentSessionCreate:
+      properties:
+        title:
+          type: string
+          title: Title
+          default: 新会话
+      type: object
+      title: AgentSessionCreate
+    AgentTurnRequest:
+      properties:
+        content:
+          type: string
+          maxLength: 50000
+          minLength: 1
+          title: Content
+      type: object
+      required:
+      - content
+      title: AgentTurnRequest
+    AutoScanJobCreate:
+      properties:
+        name:
+          type: string
+          title: Name
+        source_id:
+          type: string
+          title: Source Id
+        dataset_id:
+          type: string
+          title: Dataset Id
+        template_code:
+          type: string
+          title: Template Code
+          default: auto
+        scan_type:
+          type: string
+          title: Scan Type
+        path:
+          type: string
+          title: Path
+          default: ''
+        recursive:
+          type: boolean
+          title: Recursive
+          default: false
+        file_pattern:
+          type: string
+          title: File Pattern
+          default: '*'
+        interval_seconds:
+          type: integer
+          minimum: 30.0
+          title: Interval Seconds
+          default: 300
+        schedule_type:
+          type: string
+          title: Schedule Type
+          default: interval
+        schedule_time:
+          type: string
+          title: Schedule Time
+          default: 02:00
+        weekdays:
+          items:
+            type: integer
+          type: array
+          title: Weekdays
+        cron_expression:
+          type: string
+          title: Cron Expression
+          default: ''
+        timezone:
+          type: string
+          title: Timezone
+          default: Asia/Shanghai
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+      type: object
+      required:
+      - name
+      - source_id
+      - dataset_id
+      - scan_type
+      title: AutoScanJobCreate
+    AutoScanJobUpdate:
+      properties:
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        dataset_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Dataset Id
+        template_code:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Template Code
+        path:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Path
+        recursive:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Recursive
+        file_pattern:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: File Pattern
+        interval_seconds:
+          anyOf:
+          - type: integer
+            minimum: 30.0
+          - type: 'null'
+          title: Interval Seconds
+        schedule_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Schedule Type
+        schedule_time:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Schedule Time
+        weekdays:
+          anyOf:
+          - items:
+              type: integer
+            type: array
+          - type: 'null'
+          title: Weekdays
+        cron_expression:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cron Expression
+        timezone:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Timezone
+        enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enabled
+      type: object
+      title: AutoScanJobUpdate
+    Body_create_dataset_api_datasets_post:
+      properties:
+        name:
+          type: string
+          title: Name
+        description:
+          type: string
+          title: Description
+          default: ''
+        data_type:
+          type: string
+          title: Data Type
+          default: mixed
+      type: object
+      required:
+      - name
+      title: Body_create_dataset_api_datasets_post
+    Body_create_run_api_runs_post:
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: File
+        dataset_id:
+          type: string
+          title: Dataset Id
+        template_code:
+          type: string
+          title: Template Code
+          default: tabular_standard
+        source_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Id
+      type: object
+      required:
+      - file
+      - dataset_id
+      title: Body_create_run_api_runs_post
+    Body_inspect_upload_api_uploads_inspect_post:
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: File
+      type: object
+      required:
+      - file
+      title: Body_inspect_upload_api_uploads_inspect_post
+    DataSourceCreate:
+      properties:
+        name:
+          type: string
+          title: Name
+        source_type:
+          type: string
+          title: Source Type
+          default: upload
+        config:
+          additionalProperties: true
+          type: object
+          title: Config
+          default: {}
+      type: object
+      required:
+      - name
+      title: DataSourceCreate
+    DataSpaceCreate:
+      properties:
+        name:
+          type: string
+          maxLength: 120
+          minLength: 1
+          title: Name
+        slug:
+          type: string
+          maxLength: 64
+          minLength: 1
+          pattern: ^[a-z0-9][a-z0-9-]*$
+          title: Slug
+        database_url:
+          type: string
+          maxLength: 4000
+          minLength: 1
+          title: Database Url
+      type: object
+      required:
+      - name
+      - slug
+      - database_url
+      title: DataSpaceCreate
+    DataSpaceOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          type: string
+          title: Name
+        slug:
+          type: string
+          title: Slug
+        database_label:
+          type: string
+          title: Database Label
+        is_default:
+          type: boolean
+          title: Is Default
+        status:
+          type: string
+          title: Status
+        last_error:
+          type: string
+          title: Last Error
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - id
+      - name
+      - slug
+      - database_label
+      - is_default
+      - status
+      - last_error
+      - created_at
+      title: DataSpaceOut
+    DatasetFieldSchema:
+      properties:
+        name:
+          type: string
+          title: Name
+        data_type:
+          type: string
+          title: Data Type
+        nullable:
+          type: boolean
+          title: Nullable
+      type: object
+      required:
+      - name
+      - data_type
+      - nullable
+      title: DatasetFieldSchema
+    DatasetOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          type: string
+          title: Name
+        slug:
+          type: string
+          title: Slug
+        description:
+          type: string
+          title: Description
+        data_type:
+          type: string
+          title: Data Type
+        target_table:
+          type: string
+          title: Target Table
+        record_count:
+          type: integer
+          title: Record Count
+        last_ingested_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Ingested At
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - id
+      - name
+      - slug
+      - description
+      - data_type
+      - target_table
+      - record_count
+      - last_ingested_at
+      - created_at
+      title: DatasetOut
+    DatasetRecordChangesOut:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/DatasetRecordOut'
+          type: array
+          title: Items
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+        has_more:
+          type: boolean
+          title: Has More
+      type: object
+      required:
+      - items
+      - next_cursor
+      - has_more
+      title: DatasetRecordChangesOut
+    DatasetRecordOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        dataset_id:
+          type: string
+          title: Dataset Id
+        run_id:
+          type: string
+          title: Run Id
+        data_type:
+          type: string
+          title: Data Type
+        payload:
+          additionalProperties: true
+          type: object
+          title: Payload
+        asset_path:
+          type: string
+          title: Asset Path
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - id
+      - dataset_id
+      - run_id
+      - data_type
+      - payload
+      - asset_path
+      - created_at
+      title: DatasetRecordOut
+    DatasetSchemaOut:
+      properties:
+        schema_version:
+          type: string
+          title: Schema Version
+        sampled_records:
+          type: integer
+          title: Sampled Records
+        total_records:
+          type: integer
+          title: Total Records
+        fields:
+          items:
+            $ref: '#/components/schemas/DatasetFieldSchema'
+          type: array
+          title: Fields
+      type: object
+      required:
+      - schema_version
+      - sampled_records
+      - total_records
+      - fields
+      title: DatasetSchemaOut
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    InspectionOut:
+      properties:
+        filename:
+          type: string
+          title: Filename
+        file_type:
+          type: string
+          title: File Type
+        media_type:
+          type: string
+          title: Media Type
+        size:
+          type: integer
+          title: Size
+        recommended_pipeline:
+          type: string
+          title: Recommended Pipeline
+        preview_type:
+          type: string
+          title: Preview Type
+        columns:
+          items:
+            type: string
+          type: array
+          title: Columns
+        rows:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Rows
+        metadata:
+          additionalProperties: true
+          type: object
+          title: Metadata
+        warnings:
+          items:
+            type: string
+          type: array
+          title: Warnings
+        sheets:
+          items:
+            $ref: '#/components/schemas/SheetPreview'
+          type: array
+          title: Sheets
+      type: object
+      required:
+      - filename
+      - file_type
+      - media_type
+      - size
+      - recommended_pipeline
+      - preview_type
+      - columns
+      - rows
+      - metadata
+      - warnings
+      title: InspectionOut
+    RunListItem:
+      properties:
+        id:
+          type: string
+          title: Id
+        dataset_id:
+          type: string
+          title: Dataset Id
+        source_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Id
+        template_code:
+          type: string
+          title: Template Code
+        status:
+          type: string
+          title: Status
+        original_name:
+          type: string
+          title: Original Name
+        file_type:
+          type: string
+          title: File Type
+        file_size:
+          type: integer
+          title: File Size
+        fetched_count:
+          type: integer
+          title: Fetched Count
+        inserted_count:
+          type: integer
+          title: Inserted Count
+        duplicate_count:
+          type: integer
+          title: Duplicate Count
+        error_count:
+          type: integer
+          title: Error Count
+        error_message:
+          type: string
+          title: Error Message
+        started_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Started At
+        finished_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Finished At
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - id
+      - dataset_id
+      - source_id
+      - template_code
+      - status
+      - original_name
+      - file_type
+      - file_size
+      - fetched_count
+      - inserted_count
+      - duplicate_count
+      - error_count
+      - error_message
+      - started_at
+      - finished_at
+      - created_at
+      title: RunListItem
+    SheetPreview:
+      properties:
+        name:
+          type: string
+          title: Name
+        index:
+          type: integer
+          title: Index
+        state:
+          type: string
+          title: State
+        is_active:
+          type: boolean
+          title: Is Active
+        columns:
+          items:
+            type: string
+          type: array
+          title: Columns
+        rows:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Rows
+        metadata:
+          additionalProperties: true
+          type: object
+          title: Metadata
+        warnings:
+          items:
+            type: string
+          type: array
+          title: Warnings
+      type: object
+      required:
+      - name
+      - index
+      - state
+      - is_active
+      - columns
+      - rows
+      - metadata
+      - warnings
+      title: SheetPreview
+    TemplateOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        code:
+          type: string
+          title: Code
+        name:
+          type: string
+          title: Name
+        description:
+          type: string
+          title: Description
+        supported_types:
+          items:
+            type: string
+          type: array
+          title: Supported Types
+        steps:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Steps
+        enabled:
+          type: boolean
+          title: Enabled
+      type: object
+      required:
+      - id
+      - code
+      - name
+      - description
+      - supported_types
+      - steps
+      - enabled
+      title: TemplateOut
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+  securitySchemes:
+    OAuth2:
+      type: http
+      scheme: bearer
+      bearerFormat: OAuth 2.0 access token or AppKey
+  parameters:
+    DataIngestionSpace:
+      name: X-Data-Ingestion-Space
+      in: header
+      required: false
+      description: Data space ID or slug. Defaults to 'default' for backward compatibility.
+      schema:
+        type: string
+        default: default
+servers:
+- url: /
+  description: OpenBKN gateway
+security:
+- OAuth2: []

@@ -1,0 +1,17 @@
+# Merge this entry into the relevant DeepSeek Harness profile composition.
+# For a deployed OpenBKN instance, port-forward the internal ClusterIP service:
+#   kubectl -n openbkn port-forward svc/data-ingestion-mcp 8010:8010
+# The MCP endpoint requires the same bearer token as the OpenBKN API and checks
+# the data_ingestion:mcp_execute authorization point.
+- id: mcp-marine-ingestion
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: marine_ingestion
+    transport: streamable-http
+    url: 'http://127.0.0.1:8010/mcp'
+    headers:
+      Authorization: 'Bearer <openbkn-access-token>'
+    startupTimeoutMs: 20000
+    toolCallTimeoutMs: 300000
+    reconnect:
+      enabled: true

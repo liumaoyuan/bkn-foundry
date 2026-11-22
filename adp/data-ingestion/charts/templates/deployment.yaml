@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-ingestion
+  labels:
+    app.kubernetes.io/name: data-ingestion
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-ingestion
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: data-ingestion
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: data-ingestion
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: APP_ENV
+              value: production
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.passwordKey }}
+            - name: DATABASE_URL
+              value: "mysql+pymysql://{{ .Values.database.user }}:$(DB_PASSWORD)@{{ .Values.database.host }}:{{ .Values.database.port }}/{{ .Values.database.name }}?charset=utf8mb4"
+            - name: DATA_DIR
+              value: /data
+            - name: STORAGE_BACKEND
+              value: s3
+            - name: S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.objectStorage.existingSecret }}
+                  key: {{ .Values.objectStorage.endpointKey }}
+            - name: S3_BUCKET
+              value: {{ .Values.objectStorage.bucket | quote }}
+            - name: S3_PREFIX
+              value: {{ .Values.objectStorage.prefix | quote }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.objectStorage.existingSecret }}
+                  key: {{ .Values.objectStorage.accessKeyKey }}
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.objectStorage.existingSecret }}
+                  key: {{ .Values.objectStorage.secretKeyKey }}
+            - name: S3_REGION
+              value: {{ .Values.objectStorage.region | quote }}
+            - name: S3_FORCE_PATH_STYLE
+              value: "true"
+            - name: DATA_INGESTION_AUTH_ENABLED
+              value: "true"
+            - name: HYDRA_ADMIN_URL
+              value: {{ .Values.auth.hydraAdminURL | quote }}
+            - name: BKN_SAFE_URL
+              value: {{ .Values.auth.bknSafeURL | quote }}
+            - name: DATA_INGESTION_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.internalTokenKey }}
+            - name: DATA_SOURCE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.dataSourceSecretKey }}
+            - name: AGENT_SELF_API_URL
+              value: http://127.0.0.1:8000
+            - name: MCP_API_URL
+              value: http://127.0.0.1:8000
+            - name: MODEL_API_URL
+              value: http://mf-model-api:9898/api/mf-model-api/v1/chat/completions
+            - name: MODEL_MANAGER_URL
+              value: http://mf-model-manager:9898
+            - name: MCP_ALLOWED_ROOTS
+              value: "/data"
+            - name: AGENT_MCP_URL
+              value: "http://data-ingestion-mcp:{{ .Values.mcp.port }}{{ .Values.mcp.path }}"
+            - name: AUTO_SCAN_ENABLED
+              value: {{ .Values.scheduler.enabled | quote }}
+            - name: AUTO_SCAN_TICK_SECONDS
+              value: {{ .Values.scheduler.tickSeconds | quote }}
+            - name: AUTO_SCAN_MAX_FILES_PER_RUN
+              value: {{ .Values.scheduler.maxFilesPerRun | quote }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /data
+      volumes:
+        - name: cache
+          {{- if .Values.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+          {{- else if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: data-ingestion-files
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
