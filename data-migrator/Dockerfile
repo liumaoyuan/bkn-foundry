@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$APT_MIRROR" ]; then \
       for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
         if [ -f "$f" ]; then \
-          sed -i "s|http://archive.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g" "$f"; \
+          sed -i "s|http://archive.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://$APT_MIRROR/ubuntu|g; s|http://ports.ubuntu.com/ubuntu-ports|http://$APT_MIRROR/ubuntu-ports|g" "$f"; \
         fi; \
       done; \
     fi; \
