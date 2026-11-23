@@ -32,6 +32,8 @@ class StorageBackend(Protocol):
 
     def exists(self, uri: str) -> bool: ...
 
+    def delete(self, uri: str) -> None: ...
+
     def info(self) -> dict[str, str]: ...
 
 
@@ -88,6 +90,12 @@ class LocalStorage:
         if not path.is_absolute():
             path = STORAGE_DIR / path
         return path.resolve().is_file()
+
+    def delete(self, uri: str) -> None:
+        path = Path(uri.removeprefix("file://"))
+        if not path.is_absolute():
+            path = STORAGE_DIR / path
+        path.resolve().unlink(missing_ok=True)
 
     def info(self) -> dict[str, str]:
         return {
@@ -210,6 +218,13 @@ class S3Storage:
             return True
         except Exception:
             return False
+
+    def delete(self, uri: str) -> None:
+        if not uri.startswith("s3://"):
+            LocalStorage().delete(uri)
+            return
+        bucket, _, key = uri.removeprefix("s3://").partition("/")
+        self._client().delete_object(Bucket=bucket, Key=key)
 
     def info(self) -> dict[str, str]:
         return {

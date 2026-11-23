@@ -34,3 +34,9 @@ class FileInspectorTest(unittest.TestCase):
         )
         self.assertGreater(len(inspection["sheets"]), 1)
         self.assertTrue(all(sheet["columns"] for sheet in inspection["sheets"]))
+
+    def test_legacy_office_formats_are_rejected_with_conversion_guidance(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\.xlsx"):
+            inspect_file("legacy.xls", b"legacy")
+        with self.assertRaisesRegex(ValueError, r"\.docx"):
+            inspect_file("legacy.doc", b"legacy")

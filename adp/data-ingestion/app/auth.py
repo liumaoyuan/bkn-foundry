@@ -67,10 +67,24 @@ def required_operation(request: Request) -> str:
         return "view"
     if path.startswith("/api/bootstrap/"):
         return "task_manage"
+    if path.startswith("/api/capabilities/"):
+        if path.endswith("/execute") or path.endswith("/run"):
+            return "mcp_execute"
+        return "view" if method == "GET" else "task_manage"
     if path == "/api/spaces":
         return "view" if method == "GET" else "task_manage"
     if path.startswith("/api/spaces/") and path.endswith("/test"):
         return "task_manage"
+    if path.startswith("/api/spaces/") and path.endswith("/catalog-sync"):
+        return "task_manage"
+    if path.startswith("/api/datasets/") and method == "DELETE":
+        return "delete"
+    if path.startswith("/api/datasets/") and method == "PUT":
+        return "modify"
+    if path.startswith("/api/sources/") and method == "DELETE":
+        return "delete"
+    if path.startswith("/api/runs/") and method == "DELETE":
+        return "delete"
     if path.startswith("/api/agent"):
         return "agent_use"
     if path.startswith("/api/auto-scan/jobs"):
@@ -81,8 +95,12 @@ def required_operation(request: Request) -> str:
         return "task_manage"
     if path.startswith("/api/uploads"):
         return "create"
-    if path.startswith("/api/sources") and method == "POST":
-        return "modify" if path != "/api/sources" else "create"
+    if path.startswith("/api/sources"):
+        if method == "GET":
+            return "view"
+        if method == "POST" and path == "/api/sources":
+            return "create"
+        return "modify"
     if path == "/api/datasets" and method == "POST":
         return "create"
     return "view"

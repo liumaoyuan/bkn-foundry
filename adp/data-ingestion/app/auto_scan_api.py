@@ -69,6 +69,7 @@ def validate_scan_type(source: DataSource, scan_type: str) -> None:
         "ftp": {"ftp"},
         "sftp": {"sftp"},
         "database": {"mysql", "postgres", "postgresql"},
+        "api": {"api"},
     }
     if scan_type not in accepted:
         raise HTTPException(status_code=400, detail="不支持的扫描类型")
@@ -77,6 +78,30 @@ def validate_scan_type(source: DataSource, scan_type: str) -> None:
             status_code=400,
             detail=f"{source.source_type} 数据源不能用于 {scan_type} 扫描",
         )
+
+
+def validate_scan_requirements(
+    source: DataSource,
+    scan_type: str,
+    path: str,
+) -> None:
+    validate_scan_type(source, scan_type)
+    if scan_type == "local" and not (path or source.config.get("path")):
+        raise HTTPException(status_code=400, detail="本地扫描需要填写目录")
+    if scan_type in {"ftp", "sftp"} and not source.config.get("host"):
+        raise HTTPException(status_code=400, detail="FTP/SFTP 数据源缺少主机地址")
+    if scan_type == "database" and not str(source.config.get("query") or "").strip():
+        raise HTTPException(status_code=400, detail="数据库数据源缺少 SELECT 查询")
+    if scan_type == "database":
+        query = str(source.config.get("query") or "")
+        watermark = str(source.config.get("watermark_column") or "").strip()
+        if watermark and ":cursor" not in query:
+            raise HTTPException(
+                status_code=400,
+                detail="配置增量水位字段时，查询必须包含 :cursor 参数",
+            )
+    if scan_type == "api" and not str(source.config.get("url") or "").strip():
+        raise HTTPException(status_code=400, detail="API 数据源缺少接口地址")
 
 
 @router.get("/status")
@@ -123,9 +148,7 @@ def create_job(
         raise HTTPException(status_code=404, detail="数据源不存在")
     if db.get(Dataset, payload.dataset_id) is None:
         raise HTTPException(status_code=404, detail="目标数据集不存在")
-    validate_scan_type(source, payload.scan_type)
-    if payload.scan_type == "local" and not (payload.path or source.config.get("path")):
-        raise HTTPException(status_code=400, detail="本地扫描需要填写目录")
+    validate_scan_requirements(source, payload.scan_type, payload.path)
     job = AutoScanJob(
         name=payload.name,
         source_id=payload.source_id,
@@ -166,6 +189,11 @@ def update_job(
     values = payload.model_dump(exclude_unset=True)
     for key, value in values.items():
         setattr(job, key, value)
+    if job.source is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    if db.get(Dataset, job.dataset_id) is None:
+        raise HTTPException(status_code=404, detail="目标数据集不存在")
+    validate_scan_requirements(job.source, job.scan_type, job.path)
     if "enabled" in values:
         next_scan = utc_now()
         if not job.enabled:
@@ -193,17 +221,23 @@ def update_job(
 
 
 @router.delete("/jobs/{job_id}")
-def delete_job(job_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
+async def delete_job(job_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
     job = db.get(AutoScanJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="扫描任务不存在")
+    if not await auto_scan_scheduler.cancel_job(job_id):
+        raise HTTPException(status_code=409, detail="扫描任务正在停止，请稍后重试")
     db.delete(job)
     db.commit()
     return {"deleted": True}
 
 
 @router.post("/jobs/{job_id}/run")
-async def run_job_now(job_id: str, request: Request) -> dict[str, Any]:
+async def run_job_now(
+    job_id: str,
+    request: Request,
+    _space_db: Session = Depends(get_db),
+) -> dict[str, Any]:
     space_id = current_space_id(request)
     try:
         await auto_scan_scheduler.run_job_now(job_id, space_id)

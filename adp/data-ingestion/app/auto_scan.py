@@ -6,6 +6,9 @@ import fnmatch
 import hashlib
 import io
 import logging
+import posixpath
+import stat
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from ftplib import FTP, FTP_TLS
@@ -32,6 +35,7 @@ from .file_inspector import inspect_file
 from .ingestion_service import IngestionValidationError, create_ingestion_run
 from .models import AutoScanJob, DataSource, IngestionRun, utc_now
 from .pipeline import run_pipeline
+from .source_connectors import load_sftp_private_key, request_api_source
 
 
 logger = logging.getLogger(__name__)
@@ -103,11 +107,34 @@ class AutoScanScheduler:
     def __init__(self) -> None:
         self.task: asyncio.Task[None] | None = None
         self.running = False
+        self._job_events: dict[str, tuple[threading.Event, threading.Event]] = {}
+        self._cancel_requested: set[str] = set()
+        self._event_lock = threading.Lock()
 
     async def start(self) -> None:
         if not AUTO_SCAN_ENABLED or self.task:
             return
+        self._reset_interrupted_jobs()
         self.task = asyncio.create_task(self._loop(), name="auto-scan-scheduler")
+
+    @staticmethod
+    def _reset_interrupted_jobs() -> None:
+        for space in list_data_spaces():
+            db = session_for_space(space.id)
+            try:
+                db.query(AutoScanJob).filter(
+                    AutoScanJob.status == "running"
+                ).update(
+                    {
+                        AutoScanJob.status: "error",
+                        AutoScanJob.last_error: "服务重启导致扫描中断",
+                        AutoScanJob.updated_at: utc_now(),
+                    },
+                    synchronize_session=False,
+                )
+                db.commit()
+            finally:
+                db.close()
 
     async def stop(self) -> None:
         if not self.task:
@@ -152,6 +179,7 @@ class AutoScanScheduler:
                 select(AutoScanJob)
                 .where(
                     AutoScanJob.enabled.is_(True),
+                    AutoScanJob.status != "running",
                     or_(
                         AutoScanJob.next_scan_at.is_(None),
                         AutoScanJob.next_scan_at <= now,
@@ -190,15 +218,51 @@ class AutoScanScheduler:
             db.close()
         await asyncio.to_thread(self._scan_job_sync, job_id, space_id)
 
+    async def cancel_job(self, job_id: str, timeout: float = 30.0) -> bool:
+        with self._event_lock:
+            self._cancel_requested.add(job_id)
+            events = self._job_events.get(job_id)
+            if events:
+                events[0].set()
+        if not events:
+            return True
+        finished = await asyncio.to_thread(events[1].wait, timeout)
+        with self._event_lock:
+            self._cancel_requested.discard(job_id)
+        return bool(finished)
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        with self._event_lock:
+            events = self._job_events.get(job_id)
+            return job_id in self._cancel_requested or bool(
+                events and events[0].is_set()
+            )
+
     def _scan_job_sync(
         self,
         job_id: str,
         space_id: str = DEFAULT_SPACE_ID,
     ) -> None:
+        cancel_event = threading.Event()
+        done_event = threading.Event()
+        with self._event_lock:
+            self._job_events[job_id] = (cancel_event, done_event)
+            if job_id in self._cancel_requested:
+                cancel_event.set()
         db = session_for_space(space_id)
         try:
             job = db.get(AutoScanJob, job_id)
-            if job is None or not job.enabled:
+            if job is None:
+                return
+            if self._is_cancelled(job_id):
+                job.status = "ready"
+                job.updated_at = utc_now()
+                db.commit()
+                return
+            if not job.enabled:
+                job.status = "ready"
+                job.updated_at = utc_now()
+                db.commit()
                 return
             source = db.get(DataSource, job.source_id)
             if source is None:
@@ -209,6 +273,8 @@ class AutoScanScheduler:
                 self._scan_remote(db, job, source, space_id)
             elif job.scan_type == "database":
                 self._scan_database(db, job, source, space_id)
+            elif job.scan_type == "api":
+                self._scan_api(db, job, source, space_id)
             else:
                 raise ValueError(f"不支持的扫描类型：{job.scan_type}")
             job.status = "ready"
@@ -226,6 +292,10 @@ class AutoScanScheduler:
                 db.commit()
         finally:
             db.close()
+            with self._event_lock:
+                self._job_events.pop(job_id, None)
+                self._cancel_requested.discard(job_id)
+            done_event.set()
 
     def _scan_local(
         self,
@@ -250,6 +320,8 @@ class AutoScanScheduler:
         iterator = root.rglob(job.file_pattern) if job.recursive else root.glob(job.file_pattern)
         processed = 0
         for path in iterator:
+            if self._is_cancelled(job.id):
+                return
             if processed >= AUTO_SCAN_MAX_FILES_PER_RUN:
                 break
             if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
@@ -283,25 +355,62 @@ class AutoScanScheduler:
         port = int(config.get("port") or (22 if job.scan_type == "sftp" else 21))
         username = str(config.get("username", ""))
         password = str(config.get("password", ""))
+        private_key = str(config.get("private_key") or "")
         remote_path = job.path or str(config.get("path", "."))
         if not host:
             raise ValueError("数据源缺少 FTP/SFTP 主机")
-        files: list[tuple[str, bytes]] = []
         if job.scan_type == "sftp":
             try:
                 import paramiko
             except ImportError as error:
                 raise RuntimeError("SFTP 扫描需要 paramiko") from error
             transport = paramiko.Transport((host, port))
-            transport.connect(username=username, password=password)
+            transport.connect(
+                username=username,
+                password=password if not private_key else None,
+                pkey=load_sftp_private_key(private_key) if private_key else None,
+            )
             client = paramiko.SFTPClient.from_transport(transport)
             try:
-                for attr in client.listdir_attr(remote_path):
-                    name = attr.filename
-                    if not self._allowed_filename(name, job.file_pattern):
+                candidates: list[tuple[str, str]] = []
+
+                def walk_sftp(path: str) -> None:
+                    if self._is_cancelled(job.id):
+                        return
+                    for attr in client.listdir_attr(path):
+                        name = attr.filename
+                        full_path = posixpath.join(path, name)
+                        if attr.st_mode and stat.S_ISDIR(attr.st_mode):
+                            if job.recursive:
+                                walk_sftp(full_path)
+                            continue
+                        if self._allowed_filename(name, job.file_pattern):
+                            candidates.append((name, full_path))
+
+                walk_sftp(remote_path)
+                processed = 0
+                for filename, full_path in candidates:
+                    if self._is_cancelled(job.id):
+                        return
+                    with client.open(full_path, "rb") as handle:
+                        content = handle.read()
+                    digest = hashlib.sha256(content).hexdigest()
+                    item_key = f"sftp:{host}:{full_path}"
+                    if self._already_seen(job, item_key, digest):
                         continue
-                    with client.open(f"{remote_path.rstrip('/')}/{name}", "rb") as handle:
-                        files.append((name, handle.read()))
+                    result = self._ingest(
+                        db,
+                        job,
+                        filename=filename,
+                        content=content,
+                        space_id=space_id,
+                    )
+                    if result.status == "success":
+                        self._mark_seen(job, item_key, digest)
+                        db.commit()
+                        processed += 1
+                    if processed >= AUTO_SCAN_MAX_FILES_PER_RUN:
+                        break
             finally:
                 client.close()
                 transport.close()
@@ -312,31 +421,60 @@ class AutoScanScheduler:
             if isinstance(ftp, FTP_TLS):
                 ftp.prot_p()
             try:
-                ftp.cwd(remote_path)
-                for name in ftp.nlst():
-                    clean_name = Path(name).name
-                    if not self._allowed_filename(clean_name, job.file_pattern):
-                        continue
+                candidates: list[tuple[str, str]] = []
+
+                def walk_ftp(path: str) -> None:
+                    if self._is_cancelled(job.id):
+                        return
+                    try:
+                        entries = list(ftp.mlsd(path))
+                    except Exception as error:
+                        if job.recursive:
+                            raise RuntimeError(
+                                "当前 FTP 服务器不支持递归目录扫描"
+                            ) from error
+                        entries = [
+                            (Path(item).name, {"type": "file"})
+                            for item in ftp.nlst(path)
+                        ]
+                    for name, facts in entries:
+                        if name in {".", ".."}:
+                            continue
+                        full_path = posixpath.join(path, name)
+                        if facts.get("type") == "dir":
+                            if job.recursive:
+                                walk_ftp(full_path)
+                            continue
+                        if self._allowed_filename(name, job.file_pattern):
+                            candidates.append((name, full_path))
+
+                walk_ftp(remote_path)
+                processed = 0
+                for filename, full_path in candidates:
+                    if self._is_cancelled(job.id):
+                        return
                     buffer = io.BytesIO()
-                    ftp.retrbinary(f"RETR {clean_name}", buffer.write)
-                    files.append((clean_name, buffer.getvalue()))
+                    ftp.retrbinary(f"RETR {full_path}", buffer.write)
+                    content = buffer.getvalue()
+                    digest = hashlib.sha256(content).hexdigest()
+                    item_key = f"ftp:{host}:{full_path}"
+                    if self._already_seen(job, item_key, digest):
+                        continue
+                    result = self._ingest(
+                        db,
+                        job,
+                        filename=filename,
+                        content=content,
+                        space_id=space_id,
+                    )
+                    if result.status == "success":
+                        self._mark_seen(job, item_key, digest)
+                        db.commit()
+                        processed += 1
+                    if processed >= AUTO_SCAN_MAX_FILES_PER_RUN:
+                        break
             finally:
                 ftp.quit()
-        for filename, content in files[:AUTO_SCAN_MAX_FILES_PER_RUN]:
-            digest = hashlib.sha256(content).hexdigest()
-            item_key = f"{job.scan_type}:{host}:{remote_path.rstrip('/')}/{filename}"
-            if self._already_seen(job, item_key, digest):
-                continue
-            result = self._ingest(
-                db,
-                job,
-                filename=filename,
-                content=content,
-                space_id=space_id,
-            )
-            if result.status == "success":
-                self._mark_seen(job, item_key, digest)
-                db.commit()
 
     def _scan_database(
         self,
@@ -379,6 +517,8 @@ class AutoScanScheduler:
         engine = create_engine(url, pool_pre_ping=True)
         try:
             with engine.connect() as connection:
+                if self._is_cancelled(job.id):
+                    return
                 result = connection.execute(text(query), params)
                 rows = [dict(row) for row in result.mappings().all()]
         finally:
@@ -413,6 +553,35 @@ class AutoScanScheduler:
                 state = dict(job.scan_state or {})
                 state["cursor"] = _json_value(rows[-1].get(watermark))
                 job.scan_state = state
+            db.commit()
+
+    def _scan_api(
+        self,
+        db,
+        job: AutoScanJob,
+        source: DataSource,
+        space_id: str,
+    ) -> None:
+        config = resolved_source_config(source)
+        if self._is_cancelled(job.id):
+            return
+        filename, content, _row_count = request_api_source(
+            config,
+            source_name=source.name,
+        )
+        digest = hashlib.sha256(content).hexdigest()
+        item_key = f"api:{source.id}:{config.get('url', '')}"
+        if self._already_seen(job, item_key, digest):
+            return
+        result = self._ingest(
+            db,
+            job,
+            filename=filename,
+            content=content,
+            space_id=space_id,
+        )
+        if result.status == "success":
+            self._mark_seen(job, item_key, digest)
             db.commit()
 
     def _ingest(

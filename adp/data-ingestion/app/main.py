@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import json
 import logging
-import socket
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import quote
 
@@ -22,12 +23,10 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session, selectinload
-import httpx
-from sqlalchemy import create_engine, text
 
-from .config import APP_NAME, MAX_UPLOAD_BYTES, PROJECT_DIR
+from .config import APP_NAME, MAX_UPLOAD_BYTES
 from .database import (
     ControlDatabaseNotInitialized,
     control_database_status,
@@ -43,6 +42,8 @@ from .downstream_contract import (
 )
 from .file_inspector import inspect_file
 from .models import (
+    AutoScanJob,
+    DataAsset,
     DataSource,
     Dataset,
     DatasetRecord,
@@ -52,10 +53,21 @@ from .models import (
     utc_now,
 )
 from .pipeline import run_pipeline
+from .record_storage import (
+    backfill_dedicated_record_keys,
+    business_record_key,
+    count_dedicated_records,
+    delete_dedicated_run,
+    drop_dedicated_table,
+    page_dedicated_records,
+    sample_dedicated_records,
+)
 from .schemas import (
     DataSourceCreate,
     DataSourceOut,
+    DataSourceUpdate,
     DatasetOut,
+    DatasetUpdate,
     DatasetRecordOut,
     DatasetRecordChangesOut,
     DatasetSchemaOut,
@@ -71,17 +83,31 @@ from .agent_api import router as agent_router
 from .auto_scan import auto_scan_scheduler
 from .auto_scan_api import router as auto_scan_router
 from .bootstrap_api import router as bootstrap_router
+from .capability_api import router as capability_router
 from .space_api import router as space_router
 from .auth import PlatformAuthMiddleware
 from .config import CORS_ALLOW_ORIGINS
 from .ingestion_service import IngestionValidationError, create_ingestion_run
 from .data_source_service import (
     prepare_source_config,
+    prepare_source_config_update,
     public_source_config,
     resolved_source_config,
 )
+from .source_connectors import test_source_connection
 
 logger = logging.getLogger(__name__)
+
+
+async def read_upload_bytes(file: UploadFile) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="文件超过上传大小限制")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @asynccontextmanager
@@ -128,6 +154,7 @@ if CORS_ALLOW_ORIGINS:
     )
 app.add_middleware(PlatformAuthMiddleware)
 app.include_router(bootstrap_router)
+app.include_router(capability_router)
 app.include_router(agent_router)
 app.include_router(auto_scan_router)
 app.include_router(space_router)
@@ -173,7 +200,11 @@ def add_stages(
                 run_id=run.id,
                 sequence=sequence,
                 stage_key=step["key"],
-                name=step["name"],
+                name=(
+                    str(step.get("name") or "").strip()
+                    or str(step.get("tool_name") or "").strip()
+                    or step["key"]
+                ),
                 status="pending",
             )
         )
@@ -209,13 +240,13 @@ def storage_info(
 
 
 @app.get("/api/agent/manifest")
-def agent_manifest() -> dict[str, Any]:
-    return get_agent_manifest()
+def agent_manifest(db: Session = Depends(get_db)) -> dict[str, Any]:
+    return get_agent_manifest(db)
 
 
 @app.get("/api/agent/skill")
-def agent_skill() -> dict[str, Any]:
-    return get_skill_content()
+def agent_skill(db: Session = Depends(get_db)) -> dict[str, Any]:
+    return get_skill_content(db)
 
 
 @app.get("/api/overview")
@@ -273,8 +304,13 @@ def create_dataset(
     name: Annotated[str, Form()],
     description: Annotated[str, Form()] = "",
     data_type: Annotated[str, Form()] = "mixed",
+    storage_mode: Annotated[str, Form()] = "auto",
+    upsert_keys: Annotated[str, Form()] = "",
     db: Session = Depends(get_db),
 ) -> Dataset:
+    storage_mode = storage_mode.strip().lower()
+    if storage_mode not in {"auto", "shared", "dedicated"}:
+        raise HTTPException(status_code=400, detail="数据集存储模式无效")
     slug = "-".join(name.lower().split()) or f"dataset-{int(datetime.now().timestamp())}"
     if db.scalar(select(Dataset.id).where(Dataset.slug == slug)):
         raise HTTPException(status_code=409, detail="同名数据集已存在")
@@ -284,8 +320,91 @@ def create_dataset(
         description=description,
         data_type=data_type,
         target_table=slug.replace("-", "_"),
+        storage_mode=storage_mode,
+        upsert_keys=[
+            item.strip()
+            for item in upsert_keys.split(",")
+            if item.strip()
+        ],
     )
     db.add(dataset)
+    db.commit()
+    db.refresh(dataset)
+    if storage_mode == "dedicated":
+        from .record_storage import ensure_dataset_table
+
+        try:
+            dataset.physical_table = ensure_dataset_table(
+                db.get_bind(),
+                dataset,
+            )
+            dataset.partition_mode = (
+                "month"
+                if db.get_bind().dialect.name in {"mysql", "mariadb"}
+                else ""
+            )
+            db.commit()
+            db.refresh(dataset)
+        except Exception as error:
+            db.delete(dataset)
+            db.commit()
+            raise HTTPException(
+                status_code=503,
+                detail="独立数据表创建失败",
+            ) from error
+    return dataset
+
+
+@app.put("/api/datasets/{dataset_id}", response_model=DatasetOut)
+def update_dataset(
+    dataset_id: str,
+    payload: DatasetUpdate,
+    db: Session = Depends(get_db),
+) -> Dataset:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    values = payload.model_dump(exclude_unset=True)
+    if "name" in values and values["name"] is not None:
+        name = str(values["name"]).strip()
+        slug = "-".join(name.lower().split()) or dataset.slug
+        duplicate = db.scalar(
+            select(Dataset.id).where(
+                Dataset.slug == slug,
+                Dataset.id != dataset.id,
+            )
+        )
+        if duplicate:
+            raise HTTPException(status_code=409, detail="同名数据集已存在")
+        dataset.name = name
+        dataset.slug = slug
+    if "description" in values and values["description"] is not None:
+        dataset.description = str(values["description"])
+    if "data_type" in values and values["data_type"] is not None:
+        dataset.data_type = str(values["data_type"])
+    if "upsert_keys" in values and values["upsert_keys"] is not None:
+        dataset.upsert_keys = [
+            str(item).strip()
+            for item in values["upsert_keys"]
+            if str(item).strip()
+        ]
+        if dataset.upsert_keys:
+            if dataset.physical_table:
+                backfill_dedicated_record_keys(
+                    db.get_bind(),
+                    dataset.physical_table,
+                    dataset.upsert_keys,
+                )
+            else:
+                for record in db.scalars(
+                    select(DatasetRecord).where(
+                        DatasetRecord.dataset_id == dataset.id
+                    )
+                ).all():
+                    record.record_key = business_record_key(
+                        dataset.upsert_keys,
+                        record.payload or {},
+                    )
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -302,25 +421,108 @@ def dataset_detail(
     return dataset
 
 
+@app.delete("/api/datasets/{dataset_id}", status_code=204)
+def delete_dataset(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+) -> Response:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    physical_table = dataset.physical_table
+    active = db.scalar(
+        select(IngestionRun.id).where(
+            IngestionRun.dataset_id == dataset_id,
+            IngestionRun.status.in_(["queued", "running"]),
+        )
+    )
+    if active:
+        raise HTTPException(status_code=409, detail="数据集仍有运行中的入库任务")
+    run_ids = list(
+        db.scalars(select(IngestionRun.id).where(IngestionRun.dataset_id == dataset_id))
+    )
+    stored_paths: set[str] = set()
+    if run_ids:
+        for source_path, artifact_path in db.execute(
+            select(IngestionRun.source_path, IngestionRun.artifact_path).where(
+                IngestionRun.id.in_(run_ids)
+            )
+        ):
+            if source_path:
+                stored_paths.add(source_path)
+            if artifact_path:
+                stored_paths.add(artifact_path)
+        stored_paths.update(
+            path
+            for path in db.scalars(
+                select(DataAsset.stored_path).where(DataAsset.run_id.in_(run_ids))
+            ).all()
+            if path
+        )
+    try:
+        db.query(AutoScanJob).filter(AutoScanJob.dataset_id == dataset_id).delete(
+            synchronize_session=False
+        )
+        if run_ids:
+            db.query(DataAsset).filter(DataAsset.run_id.in_(run_ids)).delete(
+                synchronize_session=False
+            )
+            db.query(StageRun).filter(StageRun.run_id.in_(run_ids)).delete(
+                synchronize_session=False
+            )
+        db.query(DatasetRecord).filter(DatasetRecord.dataset_id == dataset_id).delete(
+            synchronize_session=False
+        )
+        if run_ids:
+            db.query(IngestionRun).filter(IngestionRun.id.in_(run_ids)).delete(
+                synchronize_session=False
+            )
+        db.delete(dataset)
+        db.commit()
+        for stored_path in stored_paths:
+            try:
+                storage.delete(stored_path)
+            except Exception:
+                logger.warning("Failed to delete dataset file: %s", stored_path)
+        if physical_table:
+            drop_dedicated_table(db.get_bind(), physical_table)
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="数据集删除失败，仍有引用") from error
+    return Response(status_code=204)
+
+
 @app.get("/api/datasets/{dataset_id}/schema", response_model=DatasetSchemaOut)
 def dataset_schema(
     dataset_id: str,
     sample_size: Annotated[int, Query(ge=1, le=500)] = 100,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if db.get(Dataset, dataset_id) is None:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
         raise HTTPException(status_code=404, detail="数据集不存在")
-    total = db.scalar(
-        select(func.count(DatasetRecord.id)).where(
-            DatasetRecord.dataset_id == dataset_id
-        )
-    ) or 0
-    records = db.scalars(
-        select(DatasetRecord)
-        .where(DatasetRecord.dataset_id == dataset_id)
-        .order_by(DatasetRecord.created_at.desc(), DatasetRecord.id.desc())
-        .limit(sample_size)
-    ).all()
+    if dataset.physical_table:
+        total = count_dedicated_records(db.get_bind(), dataset.physical_table)
+        records = [
+            SimpleNamespace(payload=item["payload"])
+            for item in sample_dedicated_records(
+                db.get_bind(),
+                dataset.physical_table,
+                limit=sample_size,
+            )
+        ]
+    else:
+        total = db.scalar(
+            select(func.count(DatasetRecord.id)).where(
+                DatasetRecord.dataset_id == dataset_id
+            )
+        ) or 0
+        records = db.scalars(
+            select(DatasetRecord)
+            .where(DatasetRecord.dataset_id == dataset_id)
+            .order_by(DatasetRecord.created_at.desc(), DatasetRecord.id.desc())
+            .limit(sample_size)
+        ).all()
     return infer_dataset_schema(records, total_records=total)
 
 
@@ -334,8 +536,71 @@ def dataset_record_changes(
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if db.get(Dataset, dataset_id) is None:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
         raise HTTPException(status_code=404, detail="数据集不存在")
+    if dataset.physical_table:
+        clauses = ["1=1"]
+        params: dict[str, Any] = {"limit": limit + 1}
+        if cursor:
+            try:
+                position = decode_record_cursor(cursor, dataset_id)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            clauses.append(
+                "(created_at > :cursor_time OR "
+                "(created_at = :cursor_time AND id > :cursor_id))"
+            )
+            params.update(
+                {
+                    "cursor_time": position.created_at.replace(tzinfo=None),
+                    "cursor_id": position.record_id,
+                }
+            )
+        with db.get_bind().connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT id, run_id, fingerprint, data_type, asset_path, "
+                    "payload, created_at "
+                    f"FROM `{dataset.physical_table}` "
+                    f"WHERE {' AND '.join(clauses)} "
+                    "ORDER BY created_at ASC, id ASC LIMIT :limit"
+                ),
+                params,
+            ).mappings().all()
+        has_more = len(rows) > limit
+        visible_rows = rows[:limit]
+        visible = [
+            {
+                "id": row["id"],
+                "dataset_id": dataset_id,
+                "run_id": row["run_id"],
+                "data_type": row["data_type"],
+                "payload": (
+                    json.loads(row["payload"])
+                    if isinstance(row["payload"], str)
+                    else row["payload"]
+                ),
+                "asset_path": row["asset_path"],
+                "created_at": row["created_at"],
+            }
+            for row in visible_rows
+        ]
+        next_cursor = None
+        if visible_rows:
+            last = visible_rows[-1]
+            next_cursor = encode_record_cursor(
+                DatasetRecord(
+                    id=last["id"],
+                    dataset_id=dataset_id,
+                    created_at=last["created_at"],
+                )
+            )
+        return {
+            "items": visible,
+            "next_cursor": next_cursor or cursor,
+            "has_more": has_more,
+        }
     statement = select(DatasetRecord).where(
         DatasetRecord.dataset_id == dataset_id
     )
@@ -438,6 +703,35 @@ def create_source(
     return serialize_source(source)
 
 
+@app.put("/api/sources/{source_id}")
+def update_source(
+    source_id: str,
+    payload: DataSourceUpdate,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    source = db.get(DataSource, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    values = payload.model_dump(exclude_unset=True)
+    if "name" in values and values["name"] is not None:
+        name = str(values["name"]).strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="数据源名称不能为空")
+        source.name = name
+    if "source_type" in values and values["source_type"] is not None:
+        source.source_type = str(values["source_type"])
+    if "config" in values and values["config"] is not None:
+        source.config = prepare_source_config_update(
+            source.config or {},
+            values["config"],
+        )
+    source.status = "ready" if source.source_type == "upload" else "configured"
+    source.last_checked_at = None
+    db.commit()
+    db.refresh(source)
+    return serialize_source(source)
+
+
 @app.post("/api/sources/{source_id}/test")
 def test_source(source_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     source = db.get(DataSource, source_id)
@@ -445,58 +739,15 @@ def test_source(source_id: str, db: Session = Depends(get_db)) -> dict[str, Any]
         raise HTTPException(status_code=404, detail="数据源不存在")
     config = resolved_source_config(source)
     try:
-        if source.source_type in {"upload", "local_dir"}:
-            configured_path = str(config.get("path", "")).strip()
-            if source.source_type == "local_dir" and not configured_path:
-                raise ValueError("本地目录数据源需要填写目录")
-            path = (
-                Path(configured_path).expanduser()
-                if configured_path
-                else Path(PROJECT_DIR)
-            )
-            if not path.exists():
-                raise FileNotFoundError(f"目录不存在：{path}")
-        elif source.source_type in {"ftp", "sftp"}:
-            host = str(config.get("host", ""))
-            port = int(config.get("port") or (22 if source.source_type == "sftp" else 21))
-            if not host:
-                raise ValueError("缺少主机地址")
-            with socket.create_connection((host, port), timeout=10):
-                pass
-        elif source.source_type in {"mysql", "postgres", "postgresql"}:
-            if source.source_type == "mysql":
-                url = "mysql+pymysql://{user}:{password}@{host}:{port}/{database}".format(
-                    user=config.get("username", ""),
-                    password=config.get("password", ""),
-                    host=config.get("host", "127.0.0.1"),
-                    port=config.get("port", 3306),
-                    database=config.get("database", ""),
-                )
-            else:
-                url = "postgresql+psycopg://{user}:{password}@{host}:{port}/{database}".format(
-                    user=config.get("username", ""),
-                    password=config.get("password", ""),
-                    host=config.get("host", "127.0.0.1"),
-                    port=config.get("port", 5432),
-                    database=config.get("database", ""),
-                )
-            engine = create_engine(url, pool_pre_ping=True)
-            try:
-                with engine.connect() as connection:
-                    connection.execute(text("SELECT 1"))
-            finally:
-                engine.dispose()
-        elif source.source_type == "api":
-            url = str(config.get("url", "")).strip()
-            if not url:
-                raise ValueError("缺少 API URL")
-            response = httpx.get(url, timeout=10)
-            response.raise_for_status()
+        details = test_source_connection(source.source_type, config)
         source.status = "ready"
         source.last_checked_at = utc_now()
         db.commit()
         db.refresh(source)
-        return serialize_source(source)
+        return {
+            **serialize_source(source),
+            "test_result": details,
+        }
     except Exception as error:
         source.status = "error"
         source.last_checked_at = utc_now()
@@ -505,6 +756,27 @@ def test_source(source_id: str, db: Session = Depends(get_db)) -> dict[str, Any]
             status_code=502,
             detail=f"{type(error).__name__}: {error}",
         ) from error
+
+
+@app.delete("/api/sources/{source_id}", status_code=204)
+def delete_source(source_id: str, db: Session = Depends(get_db)) -> Response:
+    source = db.get(DataSource, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    try:
+        db.query(AutoScanJob).filter(AutoScanJob.source_id == source_id).delete(
+            synchronize_session=False
+        )
+        db.query(IngestionRun).filter(IngestionRun.source_id == source_id).update(
+            {IngestionRun.source_id: None},
+            synchronize_session=False,
+        )
+        db.delete(source)
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="数据源删除失败，仍有引用") from error
+    return Response(status_code=204)
 
 
 @app.get("/api/runs", response_model=list[RunListItem])
@@ -523,6 +795,40 @@ def runs(
     return list(db.scalars(statement).all())
 
 
+@app.get("/api/runs/page")
+def runs_page(
+    status: Annotated[str | None, Query()] = None,
+    dataset_id: Annotated[str | None, Query()] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=200)] = 100,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    filters = []
+    if status:
+        filters.append(IngestionRun.status == status)
+    if dataset_id:
+        filters.append(IngestionRun.dataset_id == dataset_id)
+    total = db.scalar(
+        select(func.count(IngestionRun.id)).where(*filters)
+    ) or 0
+    items = db.scalars(
+        select(IngestionRun)
+        .where(*filters)
+        .order_by(IngestionRun.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+    return {
+        "items": [
+            RunListItem.model_validate(item).model_dump(mode="json")
+            for item in items
+        ],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+    }
+
+
 @app.get("/api/runs/{run_id}")
 def run_detail(run_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     run = db.scalar(
@@ -535,14 +841,68 @@ def run_detail(run_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     return serialize_run(run)
 
 
+@app.delete("/api/runs/{run_id}", status_code=204)
+def delete_run(run_id: str, db: Session = Depends(get_db)) -> Response:
+    run = db.get(IngestionRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="入库任务不存在")
+    if run.status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="运行中的入库任务不能删除")
+    source_path = run.source_path
+    artifact_path = run.artifact_path
+    dataset_id = run.dataset_id
+    dataset = db.get(Dataset, dataset_id)
+    try:
+        db.query(DataAsset).filter(DataAsset.run_id == run_id).delete(
+            synchronize_session=False
+        )
+        db.query(StageRun).filter(StageRun.run_id == run_id).delete(
+            synchronize_session=False
+        )
+        if dataset is not None and dataset.physical_table:
+            delete_dedicated_run(
+                db.get_bind(),
+                dataset.physical_table,
+                run_id,
+            )
+        else:
+            db.query(DatasetRecord).filter(DatasetRecord.run_id == run_id).delete(
+                synchronize_session=False
+            )
+        db.delete(run)
+        db.flush()
+        if dataset is not None:
+            dataset.record_count = (
+                count_dedicated_records(db.get_bind(), dataset.physical_table)
+                if dataset.physical_table
+                else (
+                    db.scalar(
+                        select(func.count(DatasetRecord.id)).where(
+                            DatasetRecord.dataset_id == dataset_id
+                        )
+                    )
+                    or 0
+                )
+            )
+        db.commit()
+        for uri in {source_path, artifact_path}:
+            if uri:
+                try:
+                    storage.delete(uri)
+                except Exception:
+                    logger.warning("Failed to delete stored object: %s", uri)
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="入库任务删除失败") from error
+    return Response(status_code=204)
+
+
 @app.post("/api/uploads/inspect", response_model=InspectionOut)
 async def inspect_upload(
     file: Annotated[UploadFile, File()],
 ) -> dict[str, Any]:
     filename = Path(file.filename or "unnamed").name
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="文件超过上传大小限制")
+    content = await read_upload_bytes(file)
     try:
         return inspect_file(filename, content)
     except Exception as error:
@@ -563,9 +923,7 @@ async def create_run(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     filename = Path(file.filename or "unnamed").name
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="文件超过上传大小限制")
+    content = await read_upload_bytes(file)
 
     try:
         run = create_ingestion_run(
@@ -598,6 +956,15 @@ def retry_run(
         raise HTTPException(status_code=404, detail="原任务不存在")
     if not previous.source_path or not storage.exists(previous.source_path):
         raise HTTPException(status_code=409, detail="原始文件已丢失，无法重试")
+    template = db.scalar(
+        select(PipelineTemplate).where(
+            PipelineTemplate.code == previous.template_code,
+            PipelineTemplate.enabled.is_(True),
+        )
+    )
+    if template is None:
+        raise HTTPException(status_code=409, detail="原任务使用的管线已删除或停用")
+    content = storage.read_bytes(previous.source_path)
     new_run = IngestionRun(
         dataset_id=previous.dataset_id,
         source_id=previous.source_id,
@@ -607,11 +974,17 @@ def retry_run(
         file_type=previous.file_type,
         media_type=previous.media_type,
         file_size=previous.file_size,
-        source_path=previous.source_path,
     )
     db.add(new_run)
     db.flush()
-    add_stages(db, new_run, get_template_steps(db, new_run.template_code))
+    new_run.source_path = storage.save_bytes(
+        "raw",
+        new_run.id,
+        previous.original_name,
+        content,
+        space_id=current_space_id(request),
+    )
+    add_stages(db, new_run, template.steps)
     db.commit()
     background_tasks.add_task(run_pipeline, new_run.id, current_space_id(request))
     db.refresh(new_run)
@@ -626,8 +999,29 @@ def dataset_records(
     q: Annotated[str | None, Query()] = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if db.get(Dataset, dataset_id) is None:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
         raise HTTPException(status_code=404, detail="数据集不存在")
+    if dataset.physical_table:
+        total, items = page_dedicated_records(
+            db.get_bind(),
+            dataset.physical_table,
+            page=page,
+            page_size=page_size,
+            query=q or "",
+        )
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [
+                {
+                    **item,
+                    "dataset_id": dataset_id,
+                }
+                for item in items
+            ],
+        }
     statement = select(DatasetRecord).where(
         DatasetRecord.dataset_id == dataset_id
     )
@@ -662,7 +1056,12 @@ def download_source_asset(run_id: str, db: Session = Depends(get_db)) -> Respons
     run = db.get(IngestionRun, run_id)
     if run is None or not run.source_path:
         raise HTTPException(status_code=404, detail="原始文件不存在")
-    content = storage.read_bytes(run.source_path)
+    if not storage.exists(run.source_path):
+        raise HTTPException(status_code=404, detail="原始文件已丢失")
+    try:
+        content = storage.read_bytes(run.source_path)
+    except Exception as error:
+        raise HTTPException(status_code=404, detail="原始文件已丢失") from error
     if not content:
         raise HTTPException(status_code=404, detail="原始文件已丢失")
     encoded = quote(run.original_name)

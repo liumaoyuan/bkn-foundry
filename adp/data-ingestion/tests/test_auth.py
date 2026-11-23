@@ -41,6 +41,14 @@ class DataIngestionAuthTest(unittest.TestCase):
             "task_manage",
         )
         self.assertEqual(
+            required_operation(request("PUT", "/api/sources/source-1")),
+            "modify",
+        )
+        self.assertEqual(
+            required_operation(request("POST", "/api/sources/source-1/test")),
+            "modify",
+        )
+        self.assertEqual(
             required_operation(request("POST", "/api/spaces")),
             "task_manage",
         )

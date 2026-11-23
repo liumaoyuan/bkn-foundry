@@ -40,11 +40,15 @@ def detect_file_type(filename: str, content: bytes) -> tuple[str, str]:
     media_type = guessed_type or "application/octet-stream"
     if suffix == ".csv":
         return "csv", "text/csv"
-    if suffix in {".xlsx", ".xlsm", ".xls"}:
+    if suffix == ".xls":
+        raise ValueError("暂不支持旧版 .xls Excel，请另存为 .xlsx 或 .xlsm 后再导入")
+    if suffix in {".xlsx", ".xlsm"}:
         return "excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if suffix == ".pdf":
         return "pdf", "application/pdf"
-    if suffix in {".docx", ".doc"}:
+    if suffix == ".doc":
+        raise ValueError("暂不支持旧版 .doc Word，请另存为 .docx 后再导入")
+    if suffix == ".docx":
         return "document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     if media_type.startswith("image/"):
         return "image", media_type

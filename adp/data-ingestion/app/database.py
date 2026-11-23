@@ -221,12 +221,39 @@ def init_database() -> None:
     Base.metadata.create_all(bind=configured_engine)
     _ensure_auto_scan_columns(configured_engine)
     _ensure_agent_session_columns(configured_engine)
+    _ensure_dataset_storage_columns(configured_engine)
+    _ensure_ingestion_columns(configured_engine)
     _ensure_default_space()
     global _control_database_initialized, _control_database_error
     _control_database_initialized = True
     for space in list_data_spaces():
         try:
-            initialize_space_database(space)
+            space_engine = initialize_space_database(space)
+            _ensure_dataset_storage_columns(space_engine)
+            _ensure_ingestion_columns(space_engine)
+            from .data_source_service import (
+                migrate_plaintext_mcp_headers,
+                migrate_plaintext_source_headers,
+            )
+            from .models import PipelineExecution, utc_now
+
+            space_db = session_factory_for_space(space.id)()
+            try:
+                migrate_plaintext_source_headers(space_db)
+                migrate_plaintext_mcp_headers(space_db)
+                space_db.query(PipelineExecution).filter(
+                    PipelineExecution.status == "running"
+                ).update(
+                    {
+                        PipelineExecution.status: "failed",
+                        PipelineExecution.error_message: "服务重启导致管线执行中断",
+                        PipelineExecution.finished_at: utc_now(),
+                    },
+                    synchronize_session=False,
+                )
+                space_db.commit()
+            finally:
+                space_db.close()
             _set_space_status(space.id, "ready")
         except Exception as error:
             _set_space_status(space.id, "error", _safe_error(error))
@@ -305,6 +332,8 @@ def initialize_space_database(space: DataSpace) -> Engine:
     Base.metadata.create_all(bind=configured_engine)
     _ensure_auto_scan_columns(configured_engine)
     _ensure_agent_session_columns(configured_engine)
+    _ensure_dataset_storage_columns(configured_engine)
+    _ensure_ingestion_columns(configured_engine)
     if space.id != DEFAULT_SPACE_ID:
         from .seed import seed_database
 
@@ -465,6 +494,58 @@ def _ensure_agent_session_columns(target_engine: Engine) -> None:
                 "ON agent_sessions (owner_id)"
             )
         )
+
+
+def _ensure_dataset_storage_columns(target_engine: Engine) -> None:
+    inspector = inspect(target_engine)
+    if "datasets" not in inspector.get_table_names():
+        return
+    existing = {
+        column["name"]
+        for column in inspector.get_columns("datasets")
+    }
+    additions = {
+        "storage_mode": "VARCHAR(24) NOT NULL DEFAULT 'auto'",
+        "physical_table": "VARCHAR(80) NOT NULL DEFAULT ''",
+        "partition_mode": "VARCHAR(24) NOT NULL DEFAULT ''",
+        "upsert_keys": "VARCHAR(1000) NOT NULL DEFAULT '[]'",
+    }
+    with target_engine.begin() as connection:
+        for column, definition in additions.items():
+            if column not in existing:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE datasets ADD COLUMN {column} {definition}"
+                    )
+                )
+
+
+def _ensure_ingestion_columns(target_engine: Engine) -> None:
+    inspector = inspect(target_engine)
+    tables = set(inspector.get_table_names())
+    additions = {
+        "ingestion_runs": {
+            "updated_count": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "dataset_records": {
+            "record_key": "VARCHAR(96) NOT NULL DEFAULT ''",
+        },
+    }
+    with target_engine.begin() as connection:
+        for table_name, columns in additions.items():
+            if table_name not in tables:
+                continue
+            existing = {
+                column["name"]
+                for column in inspector.get_columns(table_name)
+            }
+            for column, definition in columns.items():
+                if column not in existing:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}"
+                        )
+                    )
 
 
 def get_db(request: Request) -> Generator[Session, None, None]:

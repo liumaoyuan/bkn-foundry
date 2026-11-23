@@ -89,7 +89,11 @@ def create_ingestion_run(
                 run_id=run.id,
                 sequence=sequence,
                 stage_key=step["key"],
-                name=step["name"],
+                name=(
+                    str(step.get("name") or "").strip()
+                    or str(step.get("tool_name") or "").strip()
+                    or step["key"]
+                ),
                 status="pending",
             )
         )

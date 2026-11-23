@@ -34,6 +34,12 @@ WRITE_TOOLS = {
     "ingest_text",
     "create_scan_job",
     "run_scan_job_now",
+    "create_mcp_tool",
+    "call_custom_mcp_tool",
+    "create_skill",
+    "update_skill",
+    "create_ingestion_pipeline",
+    "run_user_pipeline",
 }
 LOCAL_TOOL_NAMES = {"remember_memory", "recall_memory"}
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -236,7 +242,13 @@ def _history_messages(db: Session, session_id: str) -> list[dict[str, Any]]:
 
 
 def _system_prompt(db: Session, session_id: str) -> str:
-    skill = get_skill_content()["content"]
+    skill_bundle = get_skill_content(db)
+    skill = skill_bundle["content"]
+    custom_skills = "\n\n".join(
+        f"### {item['display_name']} ({item['name']})\n{item['content']}"
+        for item in skill_bundle.get("custom", [])
+        if item.get("enabled")
+    ) or "（无用户自定义 Skill）"
     memories = db.scalars(
         select(AgentMemory)
         .where(AgentMemory.session_id == session_id)
@@ -261,6 +273,9 @@ def _system_prompt(db: Session, session_id: str) -> str:
 
 Agent Skill：
 {skill}
+
+用户自定义 Skill：
+{custom_skills}
 """.strip()
 
 

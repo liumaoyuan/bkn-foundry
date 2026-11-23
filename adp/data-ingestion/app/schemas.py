@@ -59,6 +59,12 @@ class DataSourceCreate(BaseModel):
     config: dict[str, Any] = {}
 
 
+class DataSourceUpdate(BaseModel):
+    name: str | None = None
+    source_type: str | None = None
+    config: dict[str, Any] | None = None
+
+
 class DataSourceOut(ORMModel):
     id: str
     name: str
@@ -69,6 +75,53 @@ class DataSourceOut(ORMModel):
     created_at: datetime
 
 
+class McpToolCreate(BaseModel):
+    name: str = Field(
+        min_length=2,
+        max_length=80,
+        pattern=r"^[a-zA-Z][a-zA-Z0-9_-]*$",
+    )
+    display_name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=4000)
+    read_only: bool = True
+    requires_approval: bool = True
+    tool_type: str = Field(default="http", pattern=r"^http$")
+    config: dict[str, Any]
+    enabled: bool = True
+
+
+class McpToolUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=4000)
+    read_only: bool | None = None
+    requires_approval: bool | None = None
+    config: dict[str, Any] | None = None
+    enabled: bool | None = None
+
+
+class McpToolExecuteRequest(BaseModel):
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillCreate(BaseModel):
+    name: str = Field(
+        min_length=2,
+        max_length=80,
+        pattern=r"^[a-zA-Z][a-zA-Z0-9_-]*$",
+    )
+    display_name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=4000)
+    content: str = Field(min_length=1, max_length=100000)
+    enabled: bool = True
+
+
+class SkillUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=4000)
+    content: str | None = Field(default=None, min_length=1, max_length=100000)
+    enabled: bool | None = None
+
+
 class DatasetOut(ORMModel):
     id: str
     name: str
@@ -76,9 +129,20 @@ class DatasetOut(ORMModel):
     description: str
     data_type: str
     target_table: str
+    storage_mode: str
+    upsert_keys: list[str]
+    physical_table: str
+    partition_mode: str
     record_count: int
     last_ingested_at: datetime | None
     created_at: datetime
+
+
+class DatasetUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=4000)
+    data_type: str | None = None
+    upsert_keys: list[str] | None = None
 
 
 class TemplateOut(ORMModel):
@@ -89,6 +153,45 @@ class TemplateOut(ORMModel):
     supported_types: list[str]
     steps: list[dict[str, Any]]
     enabled: bool
+
+
+class PipelineTemplateCreate(BaseModel):
+    code: str = Field(
+        min_length=3,
+        max_length=64,
+        pattern=r"^user-[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+    )
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=4000)
+    supported_types: list[str] = Field(default_factory=lambda: ["csv", "excel"])
+    steps: list[dict[str, Any]] = Field(min_length=1, max_length=50)
+    enabled: bool = True
+
+
+class PipelineTemplateUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=4000)
+    supported_types: list[str] | None = None
+    steps: list[dict[str, Any]] | None = Field(default=None, min_length=1, max_length=50)
+    enabled: bool | None = None
+
+
+class PipelineRunRequest(BaseModel):
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    step_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class PipelineExecutionCreate(BaseModel):
+    pipeline_code: str = Field(min_length=1, max_length=64)
+    pipeline_name: str = Field(min_length=1, max_length=120)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    step_inputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class PipelineExecutionUpdate(BaseModel):
+    status: str | None = None
+    results: list[dict[str, Any]] | None = None
+    error_message: str | None = None
 
 
 class StageOut(ORMModel):
@@ -119,6 +222,7 @@ class RunOut(ORMModel):
     fingerprint: str
     fetched_count: int
     inserted_count: int
+    updated_count: int
     duplicate_count: int
     error_count: int
     error_message: str
@@ -139,6 +243,7 @@ class RunListItem(ORMModel):
     file_size: int
     fetched_count: int
     inserted_count: int
+    updated_count: int
     duplicate_count: int
     error_count: int
     error_message: str
@@ -151,6 +256,7 @@ class DatasetRecordOut(ORMModel):
     id: str
     dataset_id: str
     run_id: str
+    record_key: str
     data_type: str
     payload: dict[str, Any]
     asset_path: str

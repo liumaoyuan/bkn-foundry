@@ -93,6 +93,9 @@ def test_control_database(database_url: str) -> dict[str, str | bool]:
     }
 
 
+test_control_database.__test__ = False  # type: ignore[attr-defined]
+
+
 def _ensure_database_exists(
     database_url: str,
     *,

@@ -3,12 +3,16 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import logging
+import shutil
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
 
+from .config import DATA_DIR
 from .database import DEFAULT_SPACE_ID, session_for_space
 from .file_inspector import (
     decode_text,
@@ -16,7 +20,23 @@ from .file_inspector import (
     normalize_row,
     unique_columns,
 )
-from .models import DataAsset, Dataset, DatasetRecord, IngestionRun, StageRun
+from .models import (
+    DataAsset,
+    Dataset,
+    DatasetRecord,
+    IngestionRun,
+    PipelineTemplate,
+    StageRun,
+)
+from .record_storage import (
+    business_record_key,
+    count_dedicated_records,
+    insert_dedicated_records,
+    lock_dataset_for_write,
+    persist_shared_records,
+    prepare_dataset_storage,
+    upsert_dedicated_records,
+)
 from .seed import TEMPLATES
 from .storage import storage
 
@@ -34,6 +54,54 @@ def utc_now() -> datetime:
 
 def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def payload_fingerprint(data_type: str, payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        {"data_type": data_type, "payload": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _bounded_json(value: Any, limit: int = 12000) -> str:
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[:limit] + "..."
+
+
+def _result_count(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        for key in ("inserted_count", "output_count", "record_count"):
+            if isinstance(value.get(key), int):
+                return int(value[key])
+        for key in ("records", "rows", "items", "results"):
+            if isinstance(value.get(key), list):
+                return len(value[key])
+        return 1 if value else 0
+    return 1 if value is not None else 0
+
+
+def _max_result_metric(value: Any, metric: str) -> int:
+    if isinstance(value, dict):
+        own = value.get(metric)
+        own_value = own if isinstance(own, int) else 0
+        return max(
+            own_value,
+            *(_max_result_metric(item, metric) for item in value.values()),
+        )
+    if isinstance(value, list):
+        return max((_max_result_metric(item, metric) for item in value), default=0)
+    return 0
 
 
 def set_stage(
@@ -171,6 +239,150 @@ def extract_rows(
     return [], {}, ""
 
 
+def _run_configured_pipeline(
+    db,
+    run: IngestionRun,
+    template: PipelineTemplate,
+    content: bytes,
+    stages: dict[str, StageRun],
+    set_active_stage,
+) -> tuple[int, int, int]:
+    from .mcp_server import _execute_user_pipeline
+
+    input_dir = DATA_DIR / "pipeline-inputs" / run.id
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_path = input_dir / Path(run.original_name).name
+    input_path.write_bytes(content)
+    dataset = db.get(Dataset, run.dataset_id)
+    before_count = (
+        count_dedicated_records(db.get_bind(), dataset.physical_table)
+        if dataset is not None and dataset.physical_table
+        else (
+            db.scalar(
+                select(func.count(DatasetRecord.id)).where(
+                    DatasetRecord.dataset_id == run.dataset_id
+                )
+            )
+            or 0
+        )
+    )
+
+    def on_step_start(
+        step: dict[str, Any],
+        arguments: dict[str, Any],
+        index: int,
+    ) -> None:
+        stage = stages.get(str(step.get("key") or f"step-{index}"))
+        if stage is None:
+            stage = next(
+                (
+                    item
+                    for item in stages.values()
+                    if item.sequence == index
+                ),
+                None,
+            )
+        set_active_stage(stage)
+        if stage is not None:
+            set_stage(
+                db,
+                stage,
+                status="running",
+                input_count=1,
+                summary={
+                    "tool_name": step.get("tool_name", ""),
+                    "arguments": arguments,
+                },
+                logs=[f"正在调用 MCP 工具：{step.get('tool_name', '')}"],
+            )
+
+    def on_step_result(result: dict[str, Any], _index: int) -> None:
+        stage = stages.get(str(result.get("key") or ""))
+        if stage is not None:
+            set_stage(
+                db,
+                stage,
+                status="success",
+                input_count=1,
+                output_count=_result_count(result.get("result")),
+                summary={
+                    "tool_name": result.get("tool_name", ""),
+                    "arguments": result.get("arguments", {}),
+                    "result_preview": _bounded_json(result.get("result")),
+                },
+                logs=[f"MCP 工具执行完成：{result.get('tool_name', '')}"],
+            )
+
+    try:
+        execution_results = _execute_user_pipeline(
+            template.code,
+            {
+                "code": template.code,
+                "name": template.name,
+                "steps": template.steps,
+            },
+            inputs={
+                "file_path": str(input_path),
+                "filename": run.original_name,
+                "file_type": run.file_type,
+                "media_type": run.media_type,
+                "dataset_id": run.dataset_id,
+                "source_id": run.source_id or "",
+                "run_id": run.id,
+                "ingestion_template": "auto",
+            },
+            step_inputs={},
+            on_step_start=on_step_start,
+            on_step_result=on_step_result,
+        )
+    finally:
+        shutil.rmtree(input_dir, ignore_errors=True)
+
+    db.expire_all()
+    dataset = db.get(Dataset, run.dataset_id)
+    after_count = (
+        count_dedicated_records(db.get_bind(), dataset.physical_table)
+        if dataset is not None and dataset.physical_table
+        else (
+            db.scalar(
+                select(func.count(DatasetRecord.id)).where(
+                    DatasetRecord.dataset_id == run.dataset_id
+                )
+            )
+            or 0
+        )
+    )
+    inserted = max(
+        max(
+            (
+                _max_result_metric(item.get("result"), "inserted_count")
+                for item in execution_results
+            ),
+            default=0,
+        ),
+        after_count - before_count,
+    )
+    duplicates = max(
+        (
+            _max_result_metric(item.get("result"), "duplicate_count")
+            for item in execution_results
+        ),
+        default=0,
+    )
+    updated = max(
+        (
+            _max_result_metric(item.get("result"), "updated_count")
+            for item in execution_results
+        ),
+        default=0,
+    )
+    if dataset is not None:
+        dataset.record_count = after_count
+        if inserted > 0:
+            dataset.last_ingested_at = utc_now()
+    return inserted, updated, duplicates
+
+
 def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
     db = session_for_space(space_id)
     active_stage: StageRun | None = None
@@ -183,8 +395,76 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
         db.commit()
 
         stages = {stage.stage_key: stage for stage in run.stages}
-        content = storage.read_bytes(run.source_path)
         file_type = run.file_type
+        template = db.scalar(
+            select(PipelineTemplate).where(PipelineTemplate.code == run.template_code)
+        )
+
+        def activate_stage(stage: StageRun | None) -> None:
+            nonlocal active_stage
+            active_stage = stage
+
+        active_stage = stages.get("receive")
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=1,
+                summary={"filename": run.original_name, "phase": "reading"},
+            )
+        content = storage.read_bytes(run.source_path)
+
+        active_stage = stages.get("fingerprint")
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=1,
+                summary={"phase": "hashing"},
+            )
+        run.fingerprint = sha256_bytes(content)
+        db.commit()
+
+        if run.template_code.startswith("user-"):
+            if template is None or not template.enabled:
+                raise ValueError("用户管线不存在或已停用")
+            inserted, updated, duplicates = _run_configured_pipeline(
+                db,
+                run,
+                template,
+                content,
+                stages,
+                activate_stage,
+            )
+            asset_exists = db.scalar(
+                select(DataAsset.id).where(
+                    DataAsset.run_id == run.id,
+                    DataAsset.sha256 == run.fingerprint,
+                )
+            )
+            if not asset_exists:
+                db.add(
+                    DataAsset(
+                        run_id=run.id,
+                        original_name=run.original_name,
+                        stored_path=run.source_path,
+                        media_type=run.media_type,
+                        size=run.file_size,
+                        sha256=run.fingerprint,
+                        kind="source",
+                    )
+                )
+            run.fetched_count = 1
+            run.inserted_count = inserted
+            run.updated_count = updated
+            run.duplicate_count = duplicates
+            run.error_count = 0
+            run.status = "success"
+            run.finished_at = utc_now()
+            db.commit()
+            return
 
         active_stage = stages.get("receive")
         if active_stage:
@@ -203,8 +483,6 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                 logs=["原始文件已进入持久化存储区。"],
             )
 
-        run.fingerprint = sha256_bytes(content)
-        db.commit()
         active_stage = stages.get("fingerprint")
         if active_stage:
             set_stage(
@@ -218,6 +496,14 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
             )
 
         active_stage = stages.get("validate")
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=1,
+                summary={"phase": "validating"},
+            )
         inspection = inspect_file(run.original_name, content)
         if file_type == "unknown":
             raise ValueError("暂不支持该文件类型，请先扩展解析器。")
@@ -244,8 +530,17 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
             )
 
         active_stage = stages.get("extract")
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=1,
+                summary={"phase": "extracting"},
+            )
         rows, metadata, extracted_text = extract_rows(file_type, content)
         extracted_count = len(rows) if rows else (1 if extracted_text.strip() else 0)
+        run.fetched_count = extracted_count
         artifact_path = ""
         if extracted_text:
             artifact_path = storage.save_text(
@@ -276,6 +571,14 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
             )
 
         active_stage = stages.get("normalize")
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=extracted_count,
+                summary={"phase": "normalizing"},
+            )
         normalized_rows = []
         for index, row in enumerate(rows):
             cleaned = {}
@@ -318,22 +621,26 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
 
         active_stage = stages.get("persist")
         inserted = 0
+        updated = 0
         duplicates = 0
         payloads: list[dict[str, Any]] = []
         if normalized_rows:
             payloads = [
                 {
                     "data_type": "row",
-                    "fingerprint": f"{run.fingerprint}:row:{index}",
+                    "fingerprint": payload_fingerprint("row", row),
                     "payload": row,
                 }
-                for index, row in enumerate(normalized_rows)
+                for row in normalized_rows
             ]
         elif normalized_text or file_type in {"image", "video"}:
             payloads = [
                 {
                     "data_type": "document" if normalized_text else file_type,
-                    "fingerprint": f"{run.fingerprint}:asset:0",
+                    "fingerprint": payload_fingerprint(
+                        "document" if normalized_text else file_type,
+                        {"sha256": run.fingerprint},
+                    ),
                     "payload": {
                         "filename": run.original_name,
                         "file_type": file_type,
@@ -344,31 +651,93 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                     },
                 }
             ]
-        for item in payloads:
-            exists = db.scalar(
-                select(DatasetRecord.id).where(
-                    DatasetRecord.dataset_id == run.dataset_id,
-                    DatasetRecord.fingerprint == item["fingerprint"],
-                )
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=len(payloads),
+                summary={
+                    "phase": "writing",
+                    "total": len(payloads),
+                },
             )
-            if exists:
-                duplicates += 1
-                continue
-            db.add(
-                DatasetRecord(
-                    dataset_id=run.dataset_id,
-                    run_id=run.id,
-                    fingerprint=item["fingerprint"],
-                    data_type=item["data_type"],
-                    payload=item["payload"],
-                    asset_path=(
+        dataset = lock_dataset_for_write(db, run.dataset_id)
+        upsert_keys = list(dataset.upsert_keys or []) if dataset is not None else []
+        if upsert_keys:
+            for item in payloads:
+                item["record_key"] = business_record_key(
+                    upsert_keys,
+                    item["payload"],
+                )
+                if not item["record_key"]:
+                    raise ValueError(
+                        "配置的业务主键字段在数据中不存在或为空："
+                        + ", ".join(upsert_keys)
+                    )
+        dedicated_table = (
+            prepare_dataset_storage(
+                db,
+                dataset,
+                incoming_count=len(payloads),
+                at=run.started_at or utc_now(),
+            )
+            if dataset is not None
+            else ""
+        )
+        if dedicated_table:
+            now = utc_now()
+            dedicated_records = [
+                {
+                    "id": f"{run.id[:20]}{index:012x}"[:32],
+                    "run_id": run.id,
+                    "fingerprint": item["fingerprint"],
+                    "record_key": item.get("record_key", ""),
+                    "data_type": item["data_type"],
+                    "asset_path": (
                         run.source_path
                         if item["data_type"] in {"document", "image", "video"}
                         else ""
                     ),
+                    "row_index": index,
+                    "payload": item["payload"],
+                    "created_at": now,
+                }
+                for index, item in enumerate(payloads)
+            ]
+            if upsert_keys:
+                inserted, updated, duplicates = upsert_dedicated_records(
+                    db.get_bind(),
+                    dedicated_table,
+                    dedicated_records,
                 )
+            else:
+                inserted = insert_dedicated_records(
+                    db.get_bind(),
+                    dedicated_table,
+                    dedicated_records,
+                )
+                duplicates = max(0, len(payloads) - inserted)
+        else:
+            inserted, updated, duplicates = persist_shared_records(
+                db,
+                run.dataset_id,
+                [
+                    {
+                        "run_id": run.id,
+                        "fingerprint": item["fingerprint"],
+                        "record_key": item.get("record_key", ""),
+                        "data_type": item["data_type"],
+                        "payload": item["payload"],
+                        "asset_path": (
+                            run.source_path
+                            if item["data_type"] in {"document", "image", "video"}
+                            else ""
+                        ),
+                    }
+                    for item in payloads
+                ],
             )
-            inserted += 1
         asset_exists = db.scalar(
             select(DataAsset.id).where(
                 DataAsset.run_id == run.id,
@@ -388,6 +757,7 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                 )
             )
         run.inserted_count = inserted
+        run.updated_count = updated
         run.duplicate_count = duplicates
         run.fetched_count = len(payloads)
         db.commit()
@@ -400,6 +770,7 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                 output_count=inserted,
                 summary={
                     "inserted": inserted,
+                    "updated": updated,
                     "duplicates": duplicates,
                     "target_table": (
                         db.get(Dataset, run.dataset_id).target_table
@@ -409,38 +780,55 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                 },
                 logs=[
                     f"新增 {inserted} 条记录。",
+                    f"更新 {updated} 条记录。",
                     f"跳过重复记录 {duplicates} 条。",
                 ],
             )
 
         active_stage = stages.get("verify")
-        dataset = db.get(Dataset, run.dataset_id)
-        total_records = db.scalar(
-            select(func.count(DatasetRecord.id)).where(
-                DatasetRecord.dataset_id == run.dataset_id
+        if active_stage:
+            set_stage(
+                db,
+                active_stage,
+                status="running",
+                input_count=len(payloads),
+                summary={"phase": "verifying"},
             )
-        ) or 0
+        dataset = db.get(Dataset, run.dataset_id)
+        total_records = (
+            count_dedicated_records(db.get_bind(), dedicated_table)
+            if dedicated_table
+            else (
+                db.scalar(
+                    select(func.count(DatasetRecord.id)).where(
+                        DatasetRecord.dataset_id == run.dataset_id
+                    )
+                )
+                or 0
+            )
+        )
         if dataset:
             dataset.record_count = total_records
             dataset.last_ingested_at = utc_now()
-        run.status = "success"
-        run.finished_at = utc_now()
-        run.error_count = 0
-        db.commit()
         if active_stage:
             set_stage(
                 db,
                 active_stage,
                 status="success",
-                input_count=inserted,
+                input_count=len(payloads),
                 output_count=total_records,
                 summary={
                     "dataset_total": total_records,
                     "batch_inserted": inserted,
+                    "batch_updated": updated,
                     "batch_duplicates": duplicates,
                 },
                 logs=["数据库数量核验通过，数据集目录已更新。"],
             )
+        run.status = "success"
+        run.finished_at = utc_now()
+        run.error_count = 0
+        db.commit()
     except Exception as error:
         logger.exception("Ingestion run failed: %s", run_id)
         db.rollback()

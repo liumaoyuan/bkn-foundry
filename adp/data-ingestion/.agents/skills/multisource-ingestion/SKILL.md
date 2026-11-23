@@ -1,53 +1,48 @@
 ---
 name: multisource-ingestion
-description: Inspect and ingest CSV, Excel, PDF, DOCX, image, or video files into the multi-source ingestion platform through MCP, then verify stored records, pipeline stages, and storage locations.
+description: 通过 MCP 预览并导入 CSV、Excel、PDF、DOCX、图片或视频，核验记录、管线阶段、存储位置，并管理用户自定义 MCP 工具、Skill 和数据管线。
 ---
 
-# Multisource Ingestion
+# 多源数据入库
 
-Use this skill when a user asks an Agent to preview, clean, ingest, or query files in the multi-source data platform. The Agent performs the work through the `marine_ingestion` MCP server. Follow user authorization boundaries before writing data.
+当用户要求预览、清洗、导入或查询数据时使用本 Skill。所有数据操作必须通过
+`marine_ingestion` MCP 工具完成，并遵守用户的授权范围。
 
-## Required MCP tools
+## 默认能力
 
-Use the server-qualified tool names:
+以下能力属于系统默认能力，永久启用且不能关闭或删除：
 
-- `mcp__marine_ingestion__api_health`
-- `mcp__marine_ingestion__storage_info`
-- `mcp__marine_ingestion__list_datasets`
-- `mcp__marine_ingestion__list_pipeline_templates`
-- `mcp__marine_ingestion__inspect_local_file`
-- `mcp__marine_ingestion__ingest_local_file`
-- `mcp__marine_ingestion__ingest_text`
-- `mcp__marine_ingestion__get_ingestion_run`
-- `mcp__marine_ingestion__query_dataset_records`
-- `mcp__marine_ingestion__list_scan_jobs`
-- `mcp__marine_ingestion__create_scan_job`
-- `mcp__marine_ingestion__get_scan_job`
-- `mcp__marine_ingestion__run_scan_job_now`
+- 内置入库 Agent
+- 内置 MCP 工具
+- 内置多源数据入库 Skill
+- 内置结构化表格、文档、媒体三条管线
 
-Read [references/mcp-tools.md](references/mcp-tools.md) when tool arguments, error handling, or result interpretation is unclear.
+用户可以新增、编辑、启停和删除自己创建的 MCP 工具、Skill 与数据管线。
 
-## Workflow
+## 标准流程
 
-1. Call `api_health` and `storage_info` when the platform connection or data destination is uncertain.
-2. Call `list_datasets` and `list_pipeline_templates` if the user has not supplied exact IDs.
-3. Call `inspect_local_file` before every file ingestion. Report the detected type, Sheet/sample summary, warnings, and recommended pipeline.
-4. Use an existing `dataset_id`. Do not create a dataset unless the user explicitly asks.
-5. Start with `template_code="auto"` unless the user selects a pipeline or inspection shows a concrete override.
-6. Call `ingest_local_file` for files, or `ingest_text` for small Agent-generated CSV, JSON, or Markdown content.
-7. Verify the returned run status, inserted and skipped counts, and every stage result. Query records only when the user needs data confirmation or a sample.
-8. When the user asks for recurring ingestion, create a scan job with an explicit interval, daily time, weekly days and time, or Cron expression and timezone.
+1. 不确定平台或存储状态时，调用 `api_health` 和 `storage_info`。
+2. 用户未提供准确 ID 时，调用 `list_datasets` 和 `list_pipeline_templates`。
+3. 每次文件入库前调用 `inspect_local_file`，报告文件类型、Sheet、样例、警告和推荐管线。
+4. 只能使用已存在的数据集，除非用户明确要求创建数据集。
+5. 默认使用 `template_code="auto"`，用户指定管线时使用指定代码。
+6. 文件调用 `ingest_local_file`，小型 Agent 生成内容调用 `ingest_text`。
+7. 核验任务状态、插入数、重复数、错误数和每个阶段结果。
+8. 周期性导入必须由用户明确提供周期、时间或 Cron 与目标数据集。
 
-## Ingestion rules
+## 自定义能力
 
-- A file path must be readable by the MCP process and inside its configured allowed roots.
-- Treat `ingest_local_file`, `ingest_text`, and retries as writes. Run them only for a user-requested import or a task that clearly requires persistence.
-- Do not retry a completed ingestion merely to make the UI look active. Re-ingesting identical content should return `inserted_count=0` and non-zero `duplicate_count`.
-- CSV and Excel use `tabular_standard`; PDF and DOCX use `document_standard`; image and video use `media_standard`. Prefer the inspection result over hard-coded assumptions.
-- Excel ingestion covers every worksheet. Verify the source Sheet from `__sheet_name` and `__sheet_index` when records mix multiple Sheets.
-- For storage questions, distinguish database metadata from physical source files. `storage_info` reports the active SQLite/MySQL database and local-file or S3/MinIO destination.
-- Scheduled scans require explicit user intent. Do not invent a recurring schedule, timezone, source, or target dataset. Report the returned `next_scan_at`.
+- 使用 `capability_catalog` 查看全部工具、Skill 和管线的详细信息。
+- 使用 `create_mcp_tool` 将用户提供的 HTTP API 注册为 MCP 工具。
+- 使用 `call_custom_mcp_tool` 调用用户工具，参数以 `arguments` 对象传入。
+- 使用 `create_skill` 创建 Skill，使用 `update_skill` 编辑用户 Skill。
+- 使用 `create_ingestion_pipeline` 组合内置或用户 MCP 工具形成新管线。
+- 用户对象的代码必须以 `user-` 开头，不能覆盖内置工具、Skill 或管线。
 
-## Result style
+## 安全与审批
 
-Return the run ID, final status, inserted count, duplicate count, target dataset, and any failed stage. Include a short sample or the relevant record query only when it supports the answer.
+- 入库、调用用户工具、创建/编辑能力都属于写入操作，必须等待用户批准。
+- 不得猜测文件路径、数据集 ID、工具 ID、Skill ID 或管线代码。
+- 文件路径必须在 `MCP_ALLOWED_ROOTS` 允许范围内。
+- Skill 不能要求 Agent 绕过审批、直接写数据库或泄露密钥。
+- 返回结果应包含任务 ID、状态、数量、目标数据集以及失败阶段。

@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from .catalog_sync import CatalogSyncError, sync_space_catalog
 from .database import (
     SessionLocal,
     database_label,
@@ -127,5 +128,35 @@ def test_data_space(space_id: str) -> dict[str, Any]:
             "status": space.status,
             "database_label": space.database_label,
         }
+    finally:
+        db.close()
+
+
+@router.post(
+    "/{space_id}/catalog-sync",
+    dependencies=[Depends(require_initialized_control_database)],
+)
+async def sync_data_space_catalog(
+    space_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        space = db.get(DataSpace, space_id)
+        if space is None:
+            raise HTTPException(status_code=404, detail="数据空间不存在")
+        caller = getattr(request.state, "caller", None)
+        access_token = getattr(caller, "access_token", "") if caller else ""
+        if not access_token:
+            authorization = request.headers.get("authorization", "")
+            if authorization.startswith("Bearer "):
+                access_token = authorization[7:].strip()
+        try:
+            return await sync_space_catalog(
+                space,
+                access_token=access_token,
+            )
+        except CatalogSyncError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
     finally:
         db.close()

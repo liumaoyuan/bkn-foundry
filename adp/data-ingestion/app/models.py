@@ -92,6 +92,10 @@ class Dataset(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     data_type: Mapped[str] = mapped_column(String(32), default="mixed")
     target_table: Mapped[str] = mapped_column(String(120), default="")
+    storage_mode: Mapped[str] = mapped_column(String(24), default="auto")
+    upsert_keys: Mapped[list[str]] = mapped_column(JSON, default=list)
+    physical_table: Mapped[str] = mapped_column(String(80), default="")
+    partition_mode: Mapped[str] = mapped_column(String(24), default="")
     record_count: Mapped[int] = mapped_column(Integer, default=0)
     last_ingested_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     created_at: Mapped[datetime] = mapped_column(
@@ -118,6 +122,70 @@ class PipelineTemplate(Base):
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(),
         default=utc_now,
+    )
+
+
+class PipelineExecution(Base):
+    __tablename__ = "pipeline_executions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    pipeline_code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    pipeline_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    space_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    inputs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    step_inputs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    results: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+        index=True,
+    )
+
+
+class McpToolDefinition(Base):
+    __tablename__ = "mcp_tool_definitions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    read_only: Mapped[bool] = mapped_column(default=True)
+    requires_approval: Mapped[bool] = mapped_column(default=True)
+    tool_type: Mapped[str] = mapped_column(String(24), default="http")
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    enabled: Mapped[bool] = mapped_column(default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
+class SkillDefinition(Base):
+    __tablename__ = "skill_definitions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
     )
 
 
@@ -200,6 +268,7 @@ class IngestionRun(Base):
     artifact_path: Mapped[str] = mapped_column(Text, default="")
     fetched_count: Mapped[int] = mapped_column(Integer, default=0)
     inserted_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0)
     duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str] = mapped_column(Text, default="")
@@ -273,6 +342,7 @@ class DatasetRecord(Base):
         index=True,
     )
     fingerprint: Mapped[str] = mapped_column(String(96), nullable=False)
+    record_key: Mapped[str] = mapped_column(String(96), default="", index=True)
     data_type: Mapped[str] = mapped_column(String(32), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     asset_path: Mapped[str] = mapped_column(Text, default="")
