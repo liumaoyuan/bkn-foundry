@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import socket
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -27,7 +28,14 @@ import httpx
 from sqlalchemy import create_engine, text
 
 from .config import APP_NAME, MAX_UPLOAD_BYTES, PROJECT_DIR
-from .database import current_space_id, get_db, init_database, resolve_data_space
+from .database import (
+    ControlDatabaseNotInitialized,
+    control_database_status,
+    current_space_id,
+    get_db,
+    init_database,
+    resolve_data_space,
+)
 from .downstream_contract import (
     decode_record_cursor,
     encode_record_cursor,
@@ -62,6 +70,7 @@ from .agent_catalog import get_agent_manifest, get_skill_content
 from .agent_api import router as agent_router
 from .auto_scan import auto_scan_scheduler
 from .auto_scan_api import router as auto_scan_router
+from .bootstrap_api import router as bootstrap_router
 from .space_api import router as space_router
 from .auth import PlatformAuthMiddleware
 from .config import CORS_ALLOW_ORIGINS
@@ -72,19 +81,30 @@ from .data_source_service import (
     resolved_source_config,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    init_database()
     storage.ensure_ready()
-    from .database import SessionLocal
-
-    db = SessionLocal()
+    initialized = False
     try:
-        seed_database(db)
-    finally:
-        db.close()
-    await auto_scan_scheduler.start()
+        init_database()
+        initialized = True
+    except ControlDatabaseNotInitialized:
+        logger.warning(
+            "Data-ingestion control database is not initialized; "
+            "waiting for an administrator to configure it in Studio."
+        )
+    if initialized:
+        from .database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            seed_database(db, include_examples=False)
+        finally:
+            db.close()
+        await auto_scan_scheduler.start()
     try:
         yield
     finally:
@@ -107,6 +127,7 @@ if CORS_ALLOW_ORIGINS:
         allow_headers=["Authorization", "Content-Type", "Accept-Language", "x-trace-id"],
     )
 app.add_middleware(PlatformAuthMiddleware)
+app.include_router(bootstrap_router)
 app.include_router(agent_router)
 app.include_router(auto_scan_router)
 app.include_router(space_router)
@@ -160,9 +181,11 @@ def add_stages(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
+    status = control_database_status()
     return {
         "status": "ok",
         "service": "ingestion-api",
+        "control_database": "ready" if status.initialized else "uninitialized",
         "time": datetime.now(UTC).isoformat(),
     }
 

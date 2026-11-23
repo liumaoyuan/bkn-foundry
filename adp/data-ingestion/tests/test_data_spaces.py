@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from app.database import (
     SessionLocal,
@@ -18,6 +18,7 @@ from app.database import (
     invalidate_space_cache,
     initialize_space_database,
     session_for_space,
+    validate_database_url,
 )
 from app.models import DataSpace, Dataset
 from app.schemas import DataSpaceCreate
@@ -96,6 +97,32 @@ class DataSpaceRoutingTest(unittest.TestCase):
                         control.commit()
                 finally:
                     control.close()
+
+    def test_request_without_selected_space_is_rejected(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/datasets",
+                "headers": [],
+                "query_string": b"",
+                "scheme": "http",
+                "server": ("testserver", 80),
+                "client": ("testclient", 50000),
+            }
+        )
+        with self.assertRaises(HTTPException) as caught:
+            next(get_db(request))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(caught.exception.detail, "请选择数据空间")
+
+    def test_accepts_mysql_and_mariadb_external_urls(self) -> None:
+        for database_url in (
+            "mysql+pymysql://user:password@mysql.example.com:3306/data_space",
+            "mariadb+pymysql://user:password@mariadb.example.com:3306/data_space",
+        ):
+            with self.subTest(database_url=database_url):
+                self.assertEqual(validate_database_url(database_url), database_url)
 
 
 if __name__ == "__main__":

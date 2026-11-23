@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from .database import (
     initialize_space_database,
     invalidate_space_cache,
     list_data_spaces,
+    require_initialized_control_database,
     validate_database_url,
 )
 from .models import DataSpace, new_id
@@ -26,12 +27,20 @@ from .secret_store import encrypt_secret
 router = APIRouter(prefix="/api/spaces", tags=["data-spaces"])
 
 
-@router.get("", response_model=list[DataSpaceOut])
+@router.get(
+    "",
+    response_model=list[DataSpaceOut],
+    dependencies=[Depends(require_initialized_control_database)],
+)
 def read_data_spaces() -> list[DataSpace]:
     return list_data_spaces()
 
 
-@router.post("", response_model=DataSpaceOut)
+@router.post(
+    "",
+    response_model=DataSpaceOut,
+    dependencies=[Depends(require_initialized_control_database)],
+)
 def create_data_space(payload: DataSpaceCreate) -> DataSpace:
     try:
         database_url = validate_database_url(payload.database_url)
@@ -88,7 +97,10 @@ def create_data_space(payload: DataSpaceCreate) -> DataSpace:
         db.close()
 
 
-@router.post("/{space_id}/test")
+@router.post(
+    "/{space_id}/test",
+    dependencies=[Depends(require_initialized_control_database)],
+)
 def test_data_space(space_id: str) -> dict[str, Any]:
     db = SessionLocal()
     try:

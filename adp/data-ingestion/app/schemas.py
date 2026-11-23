@@ -10,6 +10,28 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ControlDatabaseBootstrapRequest(BaseModel):
+    database_url: str = Field(min_length=1, max_length=4000)
+    create_database: bool = True
+    bootstrap_database_url: str = Field(default="", max_length=4000)
+
+
+class ControlDatabaseStatusOut(BaseModel):
+    configured: bool
+    initialized: bool
+    source: str
+    database_label: str = ""
+    error: str = ""
+    bootstrap_enabled: bool = True
+
+
+class ControlDatabaseTestOut(BaseModel):
+    connected: bool
+    database_exists: bool
+    database_name: str
+    database_label: str
+
+
 class DataSpaceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(

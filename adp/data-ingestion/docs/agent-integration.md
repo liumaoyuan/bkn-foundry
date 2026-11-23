@@ -152,7 +152,7 @@ Agent 的标准执行顺序：
 先启动 REST API：
 
 ```powershell
-cd D:\VSCodeProjects\openbkn\bkn-foundry-main\adp\data-ingestion
+cd D:\VSCodeProjects\openbkn\bkn-foundry\adp\data-ingestion
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -198,7 +198,7 @@ HTTP MCP 容器与入库 API 共享 `/data` 数据卷。Agent 传入的路径必
 本地不启动 Docker 时，也可以手工启动 HTTP MCP：
 
 ```powershell
-cd D:\VSCodeProjects\openbkn\bkn-foundry-main\adp\data-ingestion
+cd D:\VSCodeProjects\openbkn\bkn-foundry\adp\data-ingestion
 $env:MCP_TRANSPORT='streamable-http'
 $env:MCP_HOST='127.0.0.1'
 $env:MCP_PORT='8010'
@@ -209,7 +209,7 @@ python -m app.mcp_server
 ## Agent 直接入库示例
 
 ```text
-用户：把 D:\VSCodeProjects\openbkn\bkn-foundry-main\adp\data-ingestion\taiwan_marine_multi_sheet.xlsx
+用户：把 D:\VSCodeProjects\openbkn\bkn-foundry\adp\data-ingestion\taiwan_marine_multi_sheet.xlsx
 导入“台湾近海观测数据”，使用系统推荐的管线。
 ```
 

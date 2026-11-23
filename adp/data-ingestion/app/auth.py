@@ -63,6 +63,10 @@ def error_response(
 def required_operation(request: Request) -> str:
     path = request.url.path
     method = request.method.upper()
+    if path == "/api/bootstrap/status":
+        return "view"
+    if path.startswith("/api/bootstrap/"):
+        return "task_manage"
     if path == "/api/spaces":
         return "view" if method == "GET" else "task_manage"
     if path.startswith("/api/spaces/") and path.endswith("/test"):

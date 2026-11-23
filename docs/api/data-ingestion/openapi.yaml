@@ -4,6 +4,71 @@ info:
   description: 多源数据接入、清洗、入库和过程追踪 API
   version: 0.1.0
 paths:
+  /api/data-ingestion/bootstrap/status:
+    get:
+      tags:
+      - bootstrap
+      summary: Read Control Database Status
+      operationId: read_control_database_status_api_bootstrap_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlDatabaseStatusOut'
+  /api/data-ingestion/bootstrap/test:
+    post:
+      tags:
+      - bootstrap
+      summary: Test Control Database Connection
+      operationId: test_control_database_connection_api_bootstrap_test_post
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControlDatabaseBootstrapRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlDatabaseTestOut'
+        '400':
+          description: Invalid database configuration
+        '502':
+          description: Database connection failed
+  /api/data-ingestion/bootstrap/control-database:
+    post:
+      tags:
+      - bootstrap
+      summary: Initialize or Change Control Database
+      description: >-
+        Initializes the control database when none exists, or switches to a
+        different control database. Switching does not migrate or delete data
+        from the previous database.
+      operationId: initialize_control_database_api_bootstrap_control_database_post
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControlDatabaseBootstrapRequest'
+      responses:
+        '201':
+          description: Control database configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlDatabaseStatusOut'
+        '400':
+          description: Invalid database configuration
+        '409':
+          description: Control database is managed by deployment configuration
+        '502':
+          description: Control database initialization failed
   /api/data-ingestion/agent/status:
     get:
       tags:
@@ -1374,6 +1439,76 @@ components:
       required:
       - file
       title: Body_inspect_upload_api_uploads_inspect_post
+    ControlDatabaseBootstrapRequest:
+      properties:
+        database_url:
+          type: string
+          maxLength: 4000
+          minLength: 1
+          title: Database Url
+        create_database:
+          type: boolean
+          title: Create Database
+          default: true
+        bootstrap_database_url:
+          type: string
+          maxLength: 4000
+          title: Bootstrap Database Url
+          default: ''
+      type: object
+      required:
+      - database_url
+      title: ControlDatabaseBootstrapRequest
+    ControlDatabaseStatusOut:
+      properties:
+        configured:
+          type: boolean
+          title: Configured
+        initialized:
+          type: boolean
+          title: Initialized
+        source:
+          type: string
+          title: Source
+        database_label:
+          type: string
+          title: Database Label
+          default: ''
+        error:
+          type: string
+          title: Error
+          default: ''
+        bootstrap_enabled:
+          type: boolean
+          title: Bootstrap Enabled
+          default: true
+      type: object
+      required:
+      - configured
+      - initialized
+      - source
+      title: ControlDatabaseStatusOut
+    ControlDatabaseTestOut:
+      properties:
+        connected:
+          type: boolean
+          title: Connected
+        database_exists:
+          type: boolean
+          title: Database Exists
+        database_name:
+          type: string
+          title: Database Name
+        database_label:
+          type: string
+          title: Database Label
+      type: object
+      required:
+      - connected
+      - database_exists
+      - database_name
+      - database_label
+      title: ControlDatabaseTestOut
     DataSourceCreate:
       properties:
         name:

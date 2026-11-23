@@ -44,6 +44,20 @@ class DataIngestionAuthTest(unittest.TestCase):
             required_operation(request("POST", "/api/spaces")),
             "task_manage",
         )
+        self.assertEqual(
+            required_operation(request("GET", "/api/bootstrap/status")),
+            "view",
+        )
+        self.assertEqual(
+            required_operation(request("POST", "/api/bootstrap/test")),
+            "task_manage",
+        )
+        self.assertEqual(
+            required_operation(
+                request("POST", "/api/bootstrap/control-database")
+            ),
+            "task_manage",
+        )
 
     def test_error_response_has_unified_contract_and_trace_headers(self) -> None:
         response = error_response(403, "FORBIDDEN", "denied", "trace-1")

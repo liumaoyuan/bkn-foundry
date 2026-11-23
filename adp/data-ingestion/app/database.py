@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import threading
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -10,7 +16,12 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .config import APP_ENV, DATABASE_URL
+from .config import (
+    APP_ENV,
+    CONTROL_DATABASE_CONFIG_PATH,
+    DATABASE_URL,
+    ENV_DATABASE_URL,
+)
 from .models import Base, DataSpace
 from .secret_store import decrypt_secret, encrypt_secret
 
@@ -18,8 +29,22 @@ from .secret_store import decrypt_secret, encrypt_secret
 DEFAULT_SPACE_ID = "default"
 ALLOWED_DATABASE_SCHEMES = {
     "mysql",
+    "mariadb",
     "sqlite",
 }
+
+
+@dataclass(frozen=True)
+class ControlDatabaseStatus:
+    configured: bool
+    initialized: bool
+    source: str
+    database_label: str = ""
+    error: str = ""
+
+
+class ControlDatabaseNotInitialized(RuntimeError):
+    pass
 
 
 def _engine_options(database_url: str) -> dict[str, Any]:
@@ -29,32 +54,187 @@ def _engine_options(database_url: str) -> dict[str, Any]:
     return options
 
 
-engine = create_engine(DATABASE_URL, **_engine_options(DATABASE_URL))
+engine: Engine | None = None
 SessionLocal = sessionmaker(
-    bind=engine,
+    bind=None,
     class_=Session,
     autoflush=False,
     autocommit=False,
     expire_on_commit=False,
 )
+_control_database_lock = threading.RLock()
+_control_database_url = ""
+_control_database_source = "uninitialized"
+_control_database_initialized = False
+_control_database_error = ""
 _space_engine_cache: dict[str, Engine] = {}
 _space_session_cache: dict[str, sessionmaker[Session]] = {}
 
 
+def control_database_status() -> ControlDatabaseStatus:
+    return ControlDatabaseStatus(
+        configured=bool(_control_database_url),
+        initialized=_control_database_initialized,
+        source=_control_database_source,
+        database_label=(
+            database_label(_control_database_url)
+            if _control_database_url
+            else ""
+        ),
+        error=_control_database_error,
+    )
+
+
+def control_database_url() -> str:
+    return _control_database_url
+
+
+def configure_control_database(
+    database_url: str,
+    *,
+    source: str,
+    persist: bool = False,
+) -> None:
+    """Replace the control database engine without restarting the service."""
+    value = validate_database_url(database_url)
+    candidate = create_engine(value, **_engine_options(value))
+    with _control_database_lock:
+        global engine, _control_database_url
+        global _control_database_source, _control_database_initialized
+        global _control_database_error
+        previous = engine
+        engine = candidate
+        _control_database_url = value
+        _control_database_source = source
+        _control_database_initialized = False
+        _control_database_error = ""
+        SessionLocal.configure(bind=candidate)
+        if persist:
+            persist_control_database_config(value)
+        if previous is not None and previous is not candidate:
+            previous.dispose()
+
+
+def reset_control_database() -> None:
+    """Return to the uninitialized state, primarily for recovery and tests."""
+    with _control_database_lock:
+        global engine, _control_database_url
+        global _control_database_source, _control_database_initialized
+        global _control_database_error
+        previous = engine
+        engine = None
+        _control_database_url = ""
+        _control_database_source = "uninitialized"
+        _control_database_initialized = False
+        _control_database_error = ""
+        SessionLocal.configure(bind=None)
+        for configured_engine in _space_engine_cache.values():
+            configured_engine.dispose()
+        _space_engine_cache.clear()
+        _space_session_cache.clear()
+        if previous is not None:
+            previous.dispose()
+
+
+def require_control_database() -> Engine:
+    if engine is None:
+        raise ControlDatabaseNotInitialized("数据入库控制库尚未初始化")
+    return engine
+
+
+def require_initialized_control_database() -> None:
+    status = control_database_status()
+    if not status.configured or not status.initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="数据入库控制库尚未初始化",
+        )
+
+
+def persist_control_database_config(database_url: str) -> None:
+    path = CONTROL_DATABASE_CONFIG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "source": "user",
+        "database_url_encrypted": encrypt_secret(database_url),
+        "database_label": database_label(database_url),
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        # Some Windows workspace sandboxes reject replacing files in managed
+        # temporary directories even though writing the target is permitted.
+        path.write_text(temporary.read_text(encoding="utf-8"), encoding="utf-8")
+        temporary.unlink(missing_ok=True)
+
+
+def load_persisted_control_database_config() -> str:
+    path = CONTROL_DATABASE_CONFIG_PATH
+    if not path.is_file():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError("控制库配置文件无法读取") from error
+    if not isinstance(payload, dict):
+        raise ValueError("控制库配置文件格式无效")
+    encrypted = str(payload.get("database_url_encrypted") or "").strip()
+    if not encrypted:
+        raise ValueError("控制库配置文件缺少数据库连接信息")
+    try:
+        database_url = decrypt_secret(encrypted)
+    except Exception as error:
+        raise ValueError("控制库连接信息无法解密") from error
+    return validate_database_url(database_url)
+
+
+def _configure_control_database_from_environment() -> None:
+    global _control_database_error
+    if ENV_DATABASE_URL:
+        configure_control_database(ENV_DATABASE_URL, source="environment")
+        return
+    try:
+        persisted_url = load_persisted_control_database_config()
+    except ValueError as error:
+        _control_database_error = str(error)
+        return
+    if persisted_url:
+        configure_control_database(persisted_url, source="user")
+        return
+    if DATABASE_URL:
+        configure_control_database(DATABASE_URL, source="development")
+
+
 def init_database() -> None:
-    Base.metadata.create_all(bind=engine)
-    _ensure_auto_scan_columns(engine)
-    _ensure_agent_session_columns(engine)
+    configured_engine = require_control_database()
+    Base.metadata.create_all(bind=configured_engine)
+    _ensure_auto_scan_columns(configured_engine)
+    _ensure_agent_session_columns(configured_engine)
     _ensure_default_space()
+    global _control_database_initialized, _control_database_error
+    _control_database_initialized = True
     for space in list_data_spaces():
         try:
             initialize_space_database(space)
             _set_space_status(space.id, "ready")
         except Exception as error:
             _set_space_status(space.id, "error", _safe_error(error))
+    _control_database_error = ""
 
 
 def _ensure_default_space() -> None:
+    database_url = control_database_url()
     db = SessionLocal()
     try:
         if db.get(DataSpace, DEFAULT_SPACE_ID) is not None:
@@ -64,8 +244,8 @@ def _ensure_default_space() -> None:
                 id=DEFAULT_SPACE_ID,
                 name="默认数据空间",
                 slug=DEFAULT_SPACE_ID,
-                database_url_encrypted=encrypt_secret(DATABASE_URL),
-                database_label=database_label(DATABASE_URL),
+                database_url_encrypted=encrypt_secret(database_url),
+                database_label=database_label(database_url),
                 is_default=True,
                 status="ready",
             )
@@ -97,8 +277,11 @@ def validate_database_url(database_url: str) -> str:
         raise ValueError("数据库连接地址格式无效") from error
     if parsed.get_backend_name() not in ALLOWED_DATABASE_SCHEMES:
         raise ValueError("仅支持 MySQL/MariaDB 或本地开发用 SQLite")
-    if parsed.get_backend_name() == "mysql" and parsed.drivername != "mysql+pymysql":
-        raise ValueError("MySQL/MariaDB 必须使用 mysql+pymysql 驱动")
+    if parsed.get_backend_name() in {"mysql", "mariadb"} and parsed.drivername not in {
+        "mysql+pymysql",
+        "mariadb+pymysql",
+    }:
+        raise ValueError("MySQL/MariaDB 必须使用 mysql+pymysql 或 mariadb+pymysql 驱动")
     if APP_ENV == "production" and parsed.get_backend_name() == "sqlite":
         raise ValueError("生产环境的数据空间只支持 MySQL/MariaDB")
     return value
@@ -106,7 +289,7 @@ def validate_database_url(database_url: str) -> str:
 
 def _space_database_url(space: DataSpace) -> str:
     if space.id == DEFAULT_SPACE_ID:
-        return DATABASE_URL
+        return control_database_url()
     return decrypt_secret(space.database_url_encrypted)
 
 
@@ -137,7 +320,9 @@ def initialize_space_database(space: DataSpace) -> Engine:
 def session_factory_for_space(
     space_reference: str | None,
 ) -> sessionmaker[Session]:
-    reference = (space_reference or DEFAULT_SPACE_ID).strip()
+    reference = (space_reference or "").strip()
+    if not reference:
+        raise ValueError("必须选择数据空间")
     space = resolve_data_space(reference)
     cached = _space_session_cache.get(space.id)
     if cached is not None:
@@ -159,7 +344,10 @@ def session_for_space(space_reference: str | None = None) -> Session:
 
 
 def resolve_data_space(space_reference: str | None) -> DataSpace:
-    reference = (space_reference or DEFAULT_SPACE_ID).strip()
+    reference = (space_reference or "").strip()
+    if not reference:
+        raise LookupError("请选择数据空间")
+    require_initialized_control_database()
     db = SessionLocal()
     try:
         space = db.get(DataSpace, reference)
@@ -173,6 +361,7 @@ def resolve_data_space(space_reference: str | None) -> DataSpace:
 
 
 def list_data_spaces() -> list[DataSpace]:
+    require_initialized_control_database()
     db = SessionLocal()
     try:
         return list(
@@ -185,7 +374,10 @@ def list_data_spaces() -> list[DataSpace]:
 
 
 def current_space_id(request: Request) -> str:
-    return str(getattr(request.state, "data_space_id", DEFAULT_SPACE_ID))
+    space_id = str(getattr(request.state, "data_space_id", "")).strip()
+    if not space_id:
+        raise HTTPException(status_code=400, detail="请选择数据空间")
+    return space_id
 
 
 def invalidate_space_cache(space_id: str) -> None:
@@ -276,11 +468,14 @@ def _ensure_agent_session_columns(target_engine: Engine) -> None:
 
 
 def get_db(request: Request) -> Generator[Session, None, None]:
+    require_initialized_control_database()
     space_reference = (
         request.headers.get("x-data-ingestion-space")
         or request.query_params.get("space_id")
-        or DEFAULT_SPACE_ID
+        or ""
     )
+    if not space_reference.strip():
+        raise HTTPException(status_code=400, detail="请选择数据空间")
     space: DataSpace | None = None
     try:
         space = resolve_data_space(space_reference)
@@ -301,3 +496,6 @@ def get_db(request: Request) -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+_configure_control_database_from_environment()
