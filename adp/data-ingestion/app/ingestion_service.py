@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,6 +26,8 @@ def create_ingestion_run(
     template_code: str,
     source_id: str | None = None,
     space_id: str = "default",
+    source_object: str = "",
+    source_context: dict[str, Any] | None = None,
 ) -> IngestionRun:
     dataset = db.get(Dataset, dataset_id)
     if dataset is None:
@@ -70,6 +73,8 @@ def create_ingestion_run(
         template_code=template_code,
         status="queued",
         original_name=safe_filename,
+        source_object=source_object or safe_filename,
+        source_context=source_context or {},
         file_type=inspection["file_type"],
         media_type=inspection["media_type"],
         file_size=len(content),

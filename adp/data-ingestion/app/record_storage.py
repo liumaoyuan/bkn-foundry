@@ -173,6 +173,13 @@ def persist_shared_records(
             existing.data_type = str(item["data_type"])
             existing.payload = item["payload"]
             existing.asset_path = str(item.get("asset_path") or "")
+            existing.source_id = (
+                str(item["source_id"])
+                if item.get("source_id") is not None
+                else None
+            )
+            existing.source_object = str(item.get("source_object") or "")
+            existing.source_locator = item.get("source_locator") or {}
             existing_fingerprints.add(fingerprint)
             updated += 1
             continue
@@ -188,6 +195,13 @@ def persist_shared_records(
             data_type=str(item["data_type"]),
             payload=item["payload"],
             asset_path=str(item.get("asset_path") or ""),
+            source_id=(
+                str(item["source_id"])
+                if item.get("source_id") is not None
+                else None
+            ),
+            source_object=str(item.get("source_object") or ""),
+            source_locator=item.get("source_locator") or {},
         )
         db.add(new_record)
         existing_fingerprints.add(fingerprint)
@@ -256,6 +270,9 @@ def ensure_dataset_table(
         "record_key VARCHAR(96) NOT NULL DEFAULT '', "
         "data_type VARCHAR(32) NOT NULL, "
         "asset_path TEXT NOT NULL, "
+        "source_id VARCHAR(32) NULL, "
+        "source_object VARCHAR(255) NOT NULL DEFAULT '', "
+        f"source_locator {payload_type} NULL, "
         "row_index BIGINT NOT NULL DEFAULT 0, "
         f"payload {payload_type} NOT NULL, "
         "created_at DATETIME(6) NOT NULL, "
@@ -270,12 +287,20 @@ def ensure_dataset_table(
         column["name"]
         for column in inspect(engine).get_columns(table_name)
     }
-    if "record_key" not in existing:
-        with engine.begin() as connection:
+    additions = {
+        "record_key": "VARCHAR(96) NOT NULL DEFAULT ''",
+        "source_id": "VARCHAR(32) NULL",
+        "source_object": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "source_locator": f"{payload_type} NULL",
+    }
+    with engine.begin() as connection:
+        for column, definition in additions.items():
+            if column in existing:
+                continue
             connection.execute(
                 text(
                     f"ALTER TABLE {quoted} "
-                    "ADD COLUMN record_key VARCHAR(96) NOT NULL DEFAULT ''"
+                    f"ADD COLUMN {column} {definition}"
                 )
             )
     if dialect in {"mysql", "mariadb"}:
@@ -353,6 +378,9 @@ def materialize_dataset(
                     "record_key": item.record_key,
                     "data_type": item.data_type,
                     "asset_path": item.asset_path,
+                    "source_id": item.source_id,
+                    "source_object": item.source_object,
+                    "source_locator": item.source_locator or {},
                     "row_index": index,
                     "payload": item.payload,
                     "created_at": item.created_at,
@@ -430,7 +458,14 @@ def insert_dedicated_records(
         rows = [
             {
                 **record,
-            "record_key": record.get("record_key", ""),
+                "record_key": record.get("record_key", ""),
+                "source_id": record.get("source_id"),
+                "source_object": record.get("source_object", ""),
+                "source_locator": json.dumps(
+                    record.get("source_locator") or {},
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 "payload": json.dumps(record["payload"], ensure_ascii=False, default=str),
             }
             for record in unique_records
@@ -443,9 +478,10 @@ def insert_dedicated_records(
         connection.execute(
             text(
                 f"{insert_sql} INTO {quoted} "
-                "(id, run_id, fingerprint, record_key, data_type, asset_path, row_index, payload, created_at) "
+                "(id, run_id, fingerprint, record_key, data_type, asset_path, "
+                "source_id, source_object, source_locator, row_index, payload, created_at) "
                 "VALUES (:id, :run_id, :fingerprint, :record_key, :data_type, :asset_path, "
-                ":row_index, :payload, :created_at)"
+                ":source_id, :source_object, :source_locator, :row_index, :payload, :created_at)"
             ),
             rows,
         )
@@ -534,6 +570,13 @@ def upsert_dedicated_records(
                         "fingerprint": fingerprint,
                         "data_type": record["data_type"],
                         "asset_path": record.get("asset_path", ""),
+                        "source_id": record.get("source_id"),
+                        "source_object": record.get("source_object", ""),
+                        "source_locator": json.dumps(
+                            record.get("source_locator") or {},
+                            ensure_ascii=False,
+                            default=str,
+                        ),
                         "row_index": record["row_index"],
                         "payload": record["payload"],
                     }
@@ -541,6 +584,13 @@ def upsert_dedicated_records(
                 update_rows.append(
                     {
                         **record,
+                        "source_id": record.get("source_id"),
+                        "source_object": record.get("source_object", ""),
+                        "source_locator": json.dumps(
+                            record.get("source_locator") or {},
+                            ensure_ascii=False,
+                            default=str,
+                        ),
                         "payload": json.dumps(
                             record["payload"],
                             ensure_ascii=False,
@@ -569,7 +619,9 @@ def upsert_dedicated_records(
                 text(
                     f"UPDATE {quoted} SET run_id = :run_id, "
                     "fingerprint = :fingerprint, data_type = :data_type, "
-                    "asset_path = :asset_path, row_index = :row_index, "
+                    "asset_path = :asset_path, source_id = :source_id, "
+                    "source_object = :source_object, "
+                    "source_locator = :source_locator, row_index = :row_index, "
                     "payload = :payload WHERE id = :id"
                 ),
                 update_rows,
@@ -584,13 +636,22 @@ def upsert_dedicated_records(
                 text(
                     f"{insert_sql} INTO {quoted} "
                     "(id, run_id, fingerprint, record_key, data_type, asset_path, "
+                    "source_id, source_object, source_locator, "
                     "row_index, payload, created_at) VALUES "
                     "(:id, :run_id, :fingerprint, :record_key, :data_type, "
-                    ":asset_path, :row_index, :payload, :created_at)"
+                    ":asset_path, :source_id, :source_object, :source_locator, "
+                    ":row_index, :payload, :created_at)"
                 ),
                 [
                     {
                         **record,
+                        "source_id": record.get("source_id"),
+                        "source_object": record.get("source_object", ""),
+                        "source_locator": json.dumps(
+                            record.get("source_locator") or {},
+                            ensure_ascii=False,
+                            default=str,
+                        ),
                         "payload": json.dumps(
                             record["payload"],
                             ensure_ascii=False,
@@ -655,7 +716,8 @@ def sample_dedicated_records(
     with engine.connect() as connection:
         rows = connection.execute(
             text(
-                f"SELECT id, run_id, fingerprint, record_key, data_type, asset_path, payload, created_at "
+                f"SELECT id, run_id, fingerprint, record_key, data_type, asset_path, "
+                f"source_id, source_object, source_locator, payload, created_at "
                 f"FROM {_quote_table(table_name)} "
                 "ORDER BY created_at DESC, id DESC LIMIT :limit"
             ),
@@ -667,10 +729,96 @@ def sample_dedicated_records(
                 "payload": json.loads(row["payload"])
                 if isinstance(row["payload"], str)
                 else row["payload"],
+                "source_locator": json.loads(row["source_locator"])
+                if isinstance(row["source_locator"], str)
+                else row["source_locator"] or {},
                 "created_at": _utc_value(row["created_at"]),
             }
             for row in rows
         ]
+
+
+def iter_dedicated_payloads(
+    engine: Engine,
+    table_name: str,
+    *,
+    batch_size: int = 1000,
+):
+    with engine.connect() as connection:
+        result = connection.execution_options(
+            stream_results=True
+        ).execute(
+            text(
+                f"SELECT payload FROM {_quote_table(table_name)} "
+                "ORDER BY created_at ASC, id ASC"
+            )
+        )
+        while True:
+            batch = result.mappings().fetchmany(batch_size)
+            if not batch:
+                break
+            for row in batch:
+                yield (
+                    json.loads(row["payload"])
+                    if isinstance(row["payload"], str)
+                    else row["payload"]
+                )
+
+
+def backfill_dedicated_provenance(
+    engine: Engine,
+    table_name: str,
+    run_metadata: dict[str, dict[str, Any]],
+) -> int:
+    quoted = _quote_table(table_name)
+    changed = 0
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                f"SELECT id, run_id, source_object, source_locator "
+                f"FROM {quoted} ORDER BY created_at ASC, id ASC"
+            )
+        ).mappings().all()
+        for index, row in enumerate(rows, start=1):
+            existing_locator = (
+                json.loads(row["source_locator"])
+                if isinstance(row["source_locator"], str)
+                else row["source_locator"]
+            )
+            if row["source_object"] and existing_locator:
+                continue
+            metadata = run_metadata.get(str(row["run_id"]), {})
+            source_object = str(
+                row["source_object"]
+                or metadata.get("source_object")
+                or metadata.get("original_name")
+                or ""
+            )
+            locator = existing_locator or {
+                "kind": "legacy_backfill",
+                "file": source_object,
+                "row_number": index,
+                "source_uri": metadata.get("source_path") or "",
+            }
+            connection.execute(
+                text(
+                    f"UPDATE {quoted} SET source_id = :source_id, "
+                    "source_object = :source_object, "
+                    "source_locator = :source_locator WHERE id = :id"
+                ),
+                {
+                    "id": row["id"],
+                    "source_id": metadata.get("source_id"),
+                    "source_object": source_object,
+                    "source_locator": json.dumps(
+                        locator,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            )
+            changed += 1
+    return changed
 
 
 def page_dedicated_records(
@@ -697,7 +845,8 @@ def page_dedicated_records(
         )
         rows = connection.execute(
             text(
-                f"SELECT id, run_id, fingerprint, record_key, data_type, asset_path, payload, created_at "
+                f"SELECT id, run_id, fingerprint, record_key, data_type, asset_path, "
+                f"source_id, source_object, source_locator, payload, created_at "
                 f"FROM {quoted}{where} "
                 "ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"
             ),
@@ -713,6 +862,9 @@ def page_dedicated_records(
                 "payload": json.loads(row["payload"])
                 if isinstance(row["payload"], str)
                 else row["payload"],
+                "source_locator": json.loads(row["source_locator"])
+                if isinstance(row["source_locator"], str)
+                else row["source_locator"] or {},
                 "created_at": _utc_value(row["created_at"]),
             }
             for row in rows

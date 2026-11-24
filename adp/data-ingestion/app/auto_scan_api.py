@@ -11,6 +11,7 @@ from .config import AUTO_SCAN_ENABLED
 from .database import current_space_id, get_db, session_for_space
 from .models import AutoScanJob, DataSource, Dataset, utc_now
 from .schemas import AutoScanJobCreate, AutoScanJobUpdate
+from .source_connectors import database_query_mode
 
 
 router = APIRouter(prefix="/api/auto-scan", tags=["auto-scan"])
@@ -91,15 +92,27 @@ def validate_scan_requirements(
     if scan_type in {"ftp", "sftp"} and not source.config.get("host"):
         raise HTTPException(status_code=400, detail="FTP/SFTP 数据源缺少主机地址")
     if scan_type == "database" and not str(source.config.get("query") or "").strip():
-        raise HTTPException(status_code=400, detail="数据库数据源缺少 SELECT 查询")
+        if database_query_mode(source.config) != "table":
+            raise HTTPException(status_code=400, detail="数据库数据源缺少 SELECT 查询")
     if scan_type == "database":
-        query = str(source.config.get("query") or "")
-        watermark = str(source.config.get("watermark_column") or "").strip()
-        if watermark and ":cursor" not in query:
-            raise HTTPException(
-                status_code=400,
-                detail="配置增量水位字段时，查询必须包含 :cursor 参数",
-            )
+        if database_query_mode(source.config) == "table":
+            if not str(source.config.get("table_name") or "").strip():
+                raise HTTPException(status_code=400, detail="请选择要同步的数据库表")
+            if str(source.config.get("sync_mode") or "") == "incremental" and not str(
+                source.config.get("watermark_column") or ""
+            ).strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="增量同步需要选择判断数据变化的字段",
+                )
+        else:
+            query = str(source.config.get("query") or "")
+            watermark = str(source.config.get("watermark_column") or "").strip()
+            if watermark and ":cursor" not in query:
+                raise HTTPException(
+                    status_code=400,
+                    detail="配置增量水位字段时，查询必须包含 :cursor 参数",
+                )
     if scan_type == "api" and not str(source.config.get("url") or "").strip():
         raise HTTPException(status_code=400, detail="API 数据源缺少接口地址")
 

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from app.data_source_service import (
@@ -16,10 +16,15 @@ from app.data_source_service import (
     public_source_config,
     resolved_source_config,
     migrate_plaintext_source_headers,
+    validate_source_config,
 )
-from app.auto_scan_api import validate_scan_type
+from app.auto_scan_api import validate_scan_requirements, validate_scan_type
 from app.models import Base, DataSource
-from app.source_connectors import request_api_source
+from app.source_connectors import (
+    _database_catalog_data,
+    database_source_query,
+    request_api_source,
+)
 
 
 class SourceConnectorTest(unittest.TestCase):
@@ -102,6 +107,64 @@ class SourceConnectorTest(unittest.TestCase):
     def test_api_source_is_valid_for_api_auto_scan(self) -> None:
         source = DataSource(name="API", source_type="api", config={})
         validate_scan_type(source, "api")
+
+    def test_database_catalog_recommends_updated_at_and_builds_query(self) -> None:
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE orders ("
+                    "id INTEGER PRIMARY KEY, "
+                    "name TEXT, "
+                    "updated_at DATETIME NOT NULL)"
+                )
+            )
+
+        catalog = _database_catalog_data(engine, {}, table_name="orders")
+        self.assertEqual(catalog["recommended_watermark"], "updated_at")
+        self.assertEqual(catalog["recommended_sync_mode"], "incremental")
+        query = database_source_query(
+            engine,
+            {
+                "query_mode": "table",
+                "table_name": "orders",
+                "sync_mode": "incremental",
+                "watermark_column": "updated_at",
+            },
+        )
+        self.assertIn("FROM orders", query)
+        self.assertIn("updated_at >= :cursor", query)
+        self.assertTrue(query.endswith("ORDER BY updated_at ASC"))
+        engine.dispose()
+
+    def test_table_mode_source_is_valid_without_manual_sql(self) -> None:
+        source = DataSource(
+            name="Orders",
+            source_type="mysql",
+            config={
+                "query_mode": "table",
+                "table_name": "orders",
+                "sync_mode": "incremental",
+                "watermark_column": "updated_at",
+            },
+        )
+        validate_scan_requirements(source, "database", "")
+
+    def test_table_mode_requires_a_table_and_incremental_field(self) -> None:
+        with self.assertRaisesRegex(ValueError, "请选择需要同步的数据表"):
+            validate_source_config(
+                "mysql",
+                {"query_mode": "table", "sync_mode": "full"},
+            )
+        with self.assertRaisesRegex(ValueError, "需要选择判断数据变化的字段"):
+            validate_source_config(
+                "mysql",
+                {
+                    "query_mode": "table",
+                    "table_name": "orders",
+                    "sync_mode": "incremental",
+                },
+            )
 
     def test_startup_migration_encrypts_existing_plain_headers(self) -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")

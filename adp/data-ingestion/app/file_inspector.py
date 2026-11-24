@@ -6,6 +6,8 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+from .document_extraction import extract_document_content
+
 
 PIPELINE_BY_TYPE = {
     "csv": "tabular_standard",
@@ -179,41 +181,38 @@ def inspect_excel(content: bytes) -> dict[str, Any]:
 
 
 def inspect_pdf(content: bytes) -> dict[str, Any]:
-    from pypdf import PdfReader
-
-    reader = PdfReader(io.BytesIO(content))
-    text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    extracted = extract_document_content("pdf", content)
+    text = extracted.text
     excerpt = " ".join(text.split())[:1200]
+    warnings = []
+    if not excerpt:
+        warnings.append("PDF 未提取到正文或表格文本，可能需要 OCR 阶段。")
+    if extracted.metadata.get("table_extraction_warning"):
+        warnings.append(str(extracted.metadata["table_extraction_warning"]))
     return {
         "preview_type": "document",
         "columns": [],
         "rows": [],
         "metadata": {
-            "page_count": len(reader.pages),
-            "character_count": len(text),
+            **extracted.metadata,
             "excerpt": excerpt,
         },
-        "warnings": [] if excerpt else ["PDF 未提取到文本，可能需要 OCR 阶段。"],
+        "warnings": warnings,
     }
 
 
 def inspect_docx(content: bytes) -> dict[str, Any]:
-    from docx import Document
-
-    document = Document(io.BytesIO(content))
-    paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
-    text = "\n".join(paragraphs)
+    extracted = extract_document_content("document", content)
+    text = extracted.text
     return {
         "preview_type": "document",
         "columns": [],
         "rows": [],
         "metadata": {
-            "paragraph_count": len(paragraphs),
-            "table_count": len(document.tables),
-            "character_count": len(text),
+            **extracted.metadata,
             "excerpt": text[:1200],
         },
-        "warnings": [] if text else ["文档未提取到正文内容。"],
+        "warnings": [] if text else ["文档未提取到正文或表格内容。"],
     }
 
 

@@ -35,7 +35,13 @@ from .file_inspector import inspect_file
 from .ingestion_service import IngestionValidationError, create_ingestion_run
 from .models import AutoScanJob, DataSource, IngestionRun, utc_now
 from .pipeline import run_pipeline
-from .source_connectors import load_sftp_private_key, request_api_source
+from .source_connectors import (
+    database_query_mode,
+    database_source_query,
+    database_url,
+    load_sftp_private_key,
+    request_api_source,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -337,6 +343,8 @@ class AutoScanScheduler:
                 filename=path.name,
                 content=content,
                 space_id=space_id,
+                source_object=str(path.resolve()),
+                source_context={"kind": "file", "path": str(path.resolve())},
             )
             if result.status == "success":
                 self._mark_seen(job, item_key, digest)
@@ -404,6 +412,8 @@ class AutoScanScheduler:
                         filename=filename,
                         content=content,
                         space_id=space_id,
+                        source_object=full_path,
+                        source_context={"kind": "sftp", "path": full_path},
                     )
                     if result.status == "success":
                         self._mark_seen(job, item_key, digest)
@@ -466,6 +476,8 @@ class AutoScanScheduler:
                         filename=filename,
                         content=content,
                         space_id=space_id,
+                        source_object=full_path,
+                        source_context={"kind": "ftp", "path": full_path},
                     )
                     if result.status == "success":
                         self._mark_seen(job, item_key, digest)
@@ -484,38 +496,29 @@ class AutoScanScheduler:
         space_id: str,
     ) -> None:
         config = resolved_source_config(source)
-        query = str(config.get("query", "")).strip()
-        if not query.lower().startswith("select"):
-            raise ValueError("数据库扫描只允许配置 SELECT 查询")
         source_type = source.source_type
-        if source_type == "mysql":
-            url = (
-                "mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-                "?charset=utf8mb4"
-            ).format(
-                user=config.get("username", ""),
-                password=config.get("password", ""),
-                host=config.get("host", "127.0.0.1"),
-                port=config.get("port", 3306),
-                database=config.get("database", ""),
-            )
-        elif source_type in {"postgres", "postgresql"}:
-            url = "postgresql+psycopg://{user}:{password}@{host}:{port}/{database}".format(
-                user=config.get("username", ""),
-                password=config.get("password", ""),
-                host=config.get("host", "127.0.0.1"),
-                port=config.get("port", 5432),
-                database=config.get("database", ""),
-            )
-        else:
+        if source_type not in {"mysql", "postgres", "postgresql"}:
             raise ValueError("数据库扫描需要 MySQL 或 PostgreSQL 数据源")
-        watermark = str(config.get("watermark_column", "")).strip()
-        params: dict[str, Any] = {}
-        if watermark:
-            cursor = (job.scan_state or {}).get("cursor")
-            params["cursor"] = cursor or "1970-01-01T00:00:00"
-        engine = create_engine(url, pool_pre_ping=True)
+        engine = create_engine(
+            database_url(source_type, config),
+            pool_pre_ping=True,
+        )
         try:
+            query = database_source_query(engine, config)
+            if not query.lower().startswith("select"):
+                raise ValueError("数据库扫描只允许配置 SELECT 查询")
+            watermark = (
+                str(config.get("watermark_column", "")).strip()
+                if database_query_mode(config) == "custom"
+                or str(config.get("sync_mode") or "") == "incremental"
+                else ""
+            )
+            params: dict[str, Any] = {}
+            if watermark:
+                cursor = (job.scan_state or {}).get("cursor")
+                params["cursor"] = cursor or str(
+                    config.get("initial_cursor") or "1970-01-01T00:00:00"
+                )
             with engine.connect() as connection:
                 if self._is_cancelled(job.id):
                     return
@@ -540,19 +543,42 @@ class AutoScanScheduler:
         if self._already_seen(job, f"database:{job.id}", digest):
             return
         filename = f"{job.id}_{int(time.time())}.csv"
+        source_object = str(
+            config.get("table_name") or source.name or job.name
+        )
+        cursor_before = (
+            str(
+                (job.scan_state or {}).get("cursor")
+                or config.get("initial_cursor")
+                or "1970-01-01T00:00:00"
+            )
+            if watermark
+            else ""
+        )
         run = self._ingest(
             db,
             job,
             filename=filename,
             content=content,
             space_id=space_id,
+            source_object=source_object,
+            source_context={
+                "kind": "database",
+                "table_name": str(config.get("table_name") or ""),
+                "schema_name": str(config.get("schema_name") or ""),
+                "watermark_column": watermark,
+            },
         )
         if run.status == "success":
             self._mark_seen(job, f"database:{job.id}", digest)
+            cursor_after = ""
             if watermark:
                 state = dict(job.scan_state or {})
                 state["cursor"] = _json_value(rows[-1].get(watermark))
                 job.scan_state = state
+                cursor_after = str(state["cursor"])
+            run.incremental_cursor_before = cursor_before
+            run.incremental_cursor_after = cursor_after
             db.commit()
 
     def _scan_api(
@@ -579,6 +605,8 @@ class AutoScanScheduler:
             filename=filename,
             content=content,
             space_id=space_id,
+            source_object=str(config.get("url") or source.name),
+            source_context={"kind": "api", "url": str(config.get("url") or "")},
         )
         if result.status == "success":
             self._mark_seen(job, item_key, digest)
@@ -592,6 +620,8 @@ class AutoScanScheduler:
         filename: str,
         content: bytes,
         space_id: str,
+        source_object: str = "",
+        source_context: dict[str, Any] | None = None,
     ) -> IngestionRun:
         template_code = job.template_code
         if template_code == "auto":
@@ -605,6 +635,8 @@ class AutoScanScheduler:
             template_code=template_code,
             source_id=job.source_id,
             space_id=space_id,
+            source_object=source_object,
+            source_context=source_context,
         )
         run_pipeline(run.id, space_id)
         db.refresh(run)

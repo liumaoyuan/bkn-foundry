@@ -34,18 +34,23 @@ from .database import (
     get_db,
     init_database,
     resolve_data_space,
+    session_for_space,
 )
 from .downstream_contract import (
+    build_quality_report,
     decode_record_cursor,
     encode_record_cursor,
     infer_dataset_schema,
+    stable_record_id,
 )
 from .file_inspector import inspect_file
 from .models import (
     AutoScanJob,
     DataAsset,
+    DataQualityCheck,
     DataSource,
     Dataset,
+    DatasetPublication,
     DatasetRecord,
     IngestionRun,
     PipelineTemplate,
@@ -55,14 +60,17 @@ from .models import (
 from .pipeline import run_pipeline
 from .record_storage import (
     backfill_dedicated_record_keys,
+    backfill_dedicated_provenance,
     business_record_key,
     count_dedicated_records,
     delete_dedicated_run,
     drop_dedicated_table,
+    iter_dedicated_payloads,
     page_dedicated_records,
     sample_dedicated_records,
 )
 from .schemas import (
+    DatabaseCatalogRequest,
     DataSourceCreate,
     DataSourceOut,
     DataSourceUpdate,
@@ -93,10 +101,194 @@ from .data_source_service import (
     prepare_source_config_update,
     public_source_config,
     resolved_source_config,
+    validate_source_config,
 )
-from .source_connectors import test_source_connection
+from .source_connectors import inspect_database_catalog, test_source_connection
+from .catalog_sync import (
+    CatalogSyncError,
+    find_catalog_resource_id,
+    sync_space_catalog,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def dataset_sample_payloads(
+    dataset: Dataset,
+    db: Session,
+    *,
+    sample_size: int,
+) -> tuple[int, list[SimpleNamespace]]:
+    if dataset.physical_table:
+        total = count_dedicated_records(db.get_bind(), dataset.physical_table)
+        records = [
+            SimpleNamespace(payload=item["payload"])
+            for item in sample_dedicated_records(
+                db.get_bind(),
+                dataset.physical_table,
+                limit=sample_size,
+            )
+        ]
+        return total, records
+    total = db.scalar(
+        select(func.count(DatasetRecord.id)).where(
+            DatasetRecord.dataset_id == dataset.id
+        )
+    ) or 0
+    records = list(
+        db.scalars(
+            select(DatasetRecord)
+            .where(DatasetRecord.dataset_id == dataset.id)
+            .order_by(DatasetRecord.created_at.desc(), DatasetRecord.id.desc())
+            .limit(sample_size)
+        ).all()
+    )
+    return total, records
+
+
+def serialize_dataset_publication(
+    dataset_id: str,
+    publication: DatasetPublication | None,
+) -> dict[str, Any]:
+    return {
+        "dataset_id": dataset_id,
+        "catalog_id": publication.catalog_id if publication else "",
+        "resource_id": publication.resource_id if publication else "",
+        "status": publication.status if publication else "not_published",
+        "discovery_started": (
+            publication.discovery_started if publication else False
+        ),
+        "last_error": publication.last_error if publication else "",
+        "last_published_at": (
+            publication.last_published_at.isoformat()
+            if publication and publication.last_published_at
+            else None
+        ),
+    }
+
+
+async def refresh_dataset_publication(
+    request: Request,
+    dataset: Dataset,
+    publication: DatasetPublication | None,
+    db: Session,
+) -> DatasetPublication | None:
+    if (
+        publication is None
+        or publication.resource_id
+        or not publication.catalog_id
+        or publication.status != "discovering"
+    ):
+        return publication
+    authorization = request.headers.get("authorization", "")
+    access_token = (
+        authorization[7:].strip()
+        if authorization.startswith("Bearer ")
+        else ""
+    )
+    resource_id = await find_catalog_resource_id(
+        catalog_id=publication.catalog_id,
+        resource_name=dataset.physical_table or "dataset_records",
+        access_token=access_token,
+    )
+    if resource_id:
+        publication.resource_id = resource_id
+        publication.status = "ready"
+        publication.last_error = ""
+        db.commit()
+        db.refresh(publication)
+    return publication
+
+
+def iter_dataset_payloads(dataset: Dataset, db: Session):
+    if dataset.physical_table:
+        for payload in iter_dedicated_payloads(
+            db.get_bind(),
+            dataset.physical_table,
+        ):
+            yield SimpleNamespace(payload=payload)
+        return
+    statement = (
+        select(DatasetRecord)
+        .where(DatasetRecord.dataset_id == dataset.id)
+        .order_by(DatasetRecord.created_at.asc(), DatasetRecord.id.asc())
+        .execution_options(yield_per=1000)
+    )
+    yield from db.scalars(statement)
+
+
+def run_full_quality_check(
+    check_id: str,
+    dataset_id: str,
+    space_id: str,
+) -> None:
+    db = session_for_space(space_id)
+    try:
+        check = db.get(DataQualityCheck, check_id)
+        if check is None:
+            return
+        check.status = "running"
+        check.started_at = utc_now()
+        db.commit()
+        try:
+            dataset = db.get(Dataset, dataset_id)
+            if dataset is None:
+                raise LookupError("数据集不存在")
+            latest_run = db.scalar(
+                select(IngestionRun)
+                .where(IngestionRun.dataset_id == dataset_id)
+                .order_by(IngestionRun.created_at.desc())
+                .limit(1)
+            )
+            total = (
+                count_dedicated_records(db.get_bind(), dataset.physical_table)
+                if dataset.physical_table
+                else (
+                    db.scalar(
+                        select(func.count(DatasetRecord.id)).where(
+                            DatasetRecord.dataset_id == dataset_id
+                        )
+                    )
+                    or 0
+                )
+            )
+            report = build_quality_report(
+                iter_dataset_payloads(dataset, db),
+                total_records=total,
+                primary_key_fields=dataset.upsert_keys or [],
+                duplicate_count=latest_run.duplicate_count if latest_run else 0,
+                error_count=latest_run.error_count if latest_run else 0,
+                scope="full",
+            )
+            check.total_records = total
+            check.report = report
+            check.status = "completed"
+            check.finished_at = utc_now()
+        except Exception as error:
+            db.rollback()
+            check = db.get(DataQualityCheck, check_id)
+            if check is not None:
+                check.status = "failed"
+                check.error_message = f"{type(error).__name__}: {error}"
+                check.finished_at = utc_now()
+        db.commit()
+    finally:
+        db.close()
+
+
+def serialize_quality_check(check: DataQualityCheck) -> dict[str, Any]:
+    return {
+        "id": check.id,
+        "dataset_id": check.dataset_id,
+        "status": check.status,
+        "scope": check.scope,
+        "total_records": check.total_records,
+        "report": check.report or {},
+        "error_message": check.error_message,
+        "started_at": check.started_at.isoformat() if check.started_at else None,
+        "finished_at": check.finished_at.isoformat() if check.finished_at else None,
+        "created_at": check.created_at.isoformat(),
+    }
 
 
 async def read_upload_bytes(file: UploadFile) -> bytes:
@@ -150,7 +342,13 @@ if CORS_ALLOW_ORIGINS:
         allow_origins=CORS_ALLOW_ORIGINS,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "Accept-Language", "x-trace-id"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Accept-Language",
+            "X-Data-Ingestion-Space",
+            "x-trace-id",
+        ],
     )
 app.add_middleware(PlatformAuthMiddleware)
 app.include_router(bootstrap_router)
@@ -463,6 +661,12 @@ def delete_dataset(
         db.query(AutoScanJob).filter(AutoScanJob.dataset_id == dataset_id).delete(
             synchronize_session=False
         )
+        db.query(DatasetPublication).filter(
+            DatasetPublication.dataset_id == dataset_id
+        ).delete(synchronize_session=False)
+        db.query(DataQualityCheck).filter(
+            DataQualityCheck.dataset_id == dataset_id
+        ).delete(synchronize_session=False)
         if run_ids:
             db.query(DataAsset).filter(DataAsset.run_id.in_(run_ids)).delete(
                 synchronize_session=False
@@ -501,29 +705,308 @@ def dataset_schema(
     dataset = db.get(Dataset, dataset_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="数据集不存在")
+    total, records = dataset_sample_payloads(dataset, db, sample_size=sample_size)
+    return infer_dataset_schema(
+        records,
+        total_records=total,
+        primary_key_fields=dataset.upsert_keys or [],
+    )
+
+
+@app.get("/api/datasets/{dataset_id}/quality")
+def dataset_quality(
+    dataset_id: str,
+    sample_size: Annotated[int, Query(ge=1, le=500)] = 200,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    total, records = dataset_sample_payloads(dataset, db, sample_size=sample_size)
+    latest_run = db.scalar(
+        select(IngestionRun)
+        .where(IngestionRun.dataset_id == dataset_id)
+        .order_by(IngestionRun.created_at.desc())
+        .limit(1)
+    )
+    return build_quality_report(
+        records,
+        total_records=total,
+        primary_key_fields=dataset.upsert_keys or [],
+        duplicate_count=latest_run.duplicate_count if latest_run else 0,
+        error_count=latest_run.error_count if latest_run else 0,
+    )
+
+
+@app.post("/api/datasets/{dataset_id}/quality-checks", status_code=202)
+def create_full_quality_check(
+    dataset_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if db.get(Dataset, dataset_id) is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    check = DataQualityCheck(
+        dataset_id=dataset_id,
+        scope="full",
+        status="queued",
+    )
+    db.add(check)
+    db.commit()
+    db.refresh(check)
+    background_tasks.add_task(
+        run_full_quality_check,
+        check.id,
+        dataset_id,
+        current_space_id(request),
+    )
+    return serialize_quality_check(check)
+
+
+@app.get("/api/datasets/{dataset_id}/quality-checks/latest")
+def latest_full_quality_check(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if db.get(Dataset, dataset_id) is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    check = db.scalar(
+        select(DataQualityCheck)
+        .where(
+            DataQualityCheck.dataset_id == dataset_id,
+            DataQualityCheck.scope == "full",
+        )
+        .order_by(DataQualityCheck.created_at.desc())
+        .limit(1)
+    )
+    return (
+        serialize_quality_check(check)
+        if check is not None
+        else {
+            "id": "",
+            "dataset_id": dataset_id,
+            "status": "not_started",
+            "scope": "full",
+            "total_records": 0,
+            "report": {},
+            "error_message": "",
+            "started_at": None,
+            "finished_at": None,
+            "created_at": None,
+        }
+    )
+
+
+@app.get("/api/datasets/{dataset_id}/quality-checks/{check_id}")
+def full_quality_check(
+    dataset_id: str,
+    check_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    check = db.get(DataQualityCheck, check_id)
+    if check is None or check.dataset_id != dataset_id:
+        raise HTTPException(status_code=404, detail="质量检查任务不存在")
+    return serialize_quality_check(check)
+
+
+@app.post("/api/datasets/{dataset_id}/provenance/backfill")
+def backfill_dataset_provenance(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    runs = list(
+        db.scalars(
+            select(IngestionRun).where(
+                IngestionRun.dataset_id == dataset_id
+            )
+        ).all()
+    )
+    run_metadata = {
+        run.id: {
+            "source_id": run.source_id,
+            "source_object": run.source_object,
+            "original_name": run.original_name,
+            "source_path": run.source_path,
+        }
+        for run in runs
+    }
+    changed = 0
     if dataset.physical_table:
-        total = count_dedicated_records(db.get_bind(), dataset.physical_table)
-        records = [
-            SimpleNamespace(payload=item["payload"])
-            for item in sample_dedicated_records(
-                db.get_bind(),
-                dataset.physical_table,
-                limit=sample_size,
-            )
-        ]
+        changed = backfill_dedicated_provenance(
+            db.get_bind(),
+            dataset.physical_table,
+            run_metadata,
+        )
     else:
-        total = db.scalar(
-            select(func.count(DatasetRecord.id)).where(
-                DatasetRecord.dataset_id == dataset_id
-            )
-        ) or 0
+        row_number = 0
         records = db.scalars(
             select(DatasetRecord)
             .where(DatasetRecord.dataset_id == dataset_id)
-            .order_by(DatasetRecord.created_at.desc(), DatasetRecord.id.desc())
-            .limit(sample_size)
-        ).all()
-    return infer_dataset_schema(records, total_records=total)
+            .order_by(DatasetRecord.created_at.asc(), DatasetRecord.id.asc())
+        )
+        for record in records:
+            row_number += 1
+            if record.source_object and record.source_locator:
+                continue
+            metadata = run_metadata.get(record.run_id, {})
+            source_object = str(
+                record.source_object
+                or metadata.get("source_object")
+                or metadata.get("original_name")
+                or ""
+            )
+            record.source_id = (
+                record.source_id or metadata.get("source_id")
+            )
+            record.source_object = source_object
+            if not record.source_locator:
+                record.source_locator = {
+                    "kind": "legacy_backfill",
+                    "file": source_object,
+                    "row_number": row_number,
+                    "source_uri": metadata.get("source_path") or "",
+                }
+            changed += 1
+        db.commit()
+    return {
+        "dataset_id": dataset_id,
+        "updated_records": changed,
+        "status": "completed",
+    }
+
+
+@app.get("/api/datasets/{dataset_id}/publication")
+async def dataset_publication(
+    dataset_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    publication = db.get(DatasetPublication, dataset_id)
+    publication = await refresh_dataset_publication(
+        request,
+        dataset,
+        publication,
+        db,
+    )
+    return serialize_dataset_publication(
+        dataset_id,
+        publication,
+    )
+
+
+@app.post("/api/datasets/{dataset_id}/publish")
+async def publish_dataset(
+    dataset_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    space = resolve_data_space(current_space_id(request))
+    authorization = request.headers.get("authorization", "")
+    access_token = (
+        authorization[7:].strip()
+        if authorization.startswith("Bearer ")
+        else ""
+    )
+    publication = db.get(DatasetPublication, dataset_id)
+    if publication is None:
+        publication = DatasetPublication(dataset_id=dataset_id)
+        db.add(publication)
+    try:
+        result = await sync_space_catalog(
+            space,
+            access_token=access_token,
+            resource_name=dataset.physical_table or "dataset_records",
+        )
+        publication.catalog_id = str(result.get("catalog_id") or "")
+        publication.resource_id = str(result.get("resource_id") or "")
+        publication.discovery_started = bool(
+            result.get("discovery_started")
+        )
+        publication.status = (
+            "ready"
+            if publication.resource_id
+            else "discovering"
+            if publication.discovery_started
+            else "catalog_ready"
+        )
+        publication.last_error = ""
+        publication.last_published_at = utc_now()
+        db.commit()
+        db.refresh(publication)
+        return serialize_dataset_publication(dataset_id, publication)
+    except Exception as error:
+        db.rollback()
+        publication = db.get(DatasetPublication, dataset_id)
+        if publication is None:
+            publication = DatasetPublication(dataset_id=dataset_id)
+            db.add(publication)
+        publication.status = "failed"
+        publication.last_error = f"{type(error).__name__}: {error}"
+        publication.last_published_at = utc_now()
+        db.commit()
+        message = (
+            str(error)
+            if isinstance(error, CatalogSyncError)
+            else f"Vega 发布失败：{type(error).__name__}: {error}"
+        )
+        raise HTTPException(status_code=502, detail=message) from error
+
+
+@app.get("/api/datasets/{dataset_id}/contract")
+async def dataset_contract(
+    dataset_id: str,
+    request: Request,
+    sample_size: Annotated[int, Query(ge=1, le=500)] = 200,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    dataset = db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    total, records = dataset_sample_payloads(dataset, db, sample_size=sample_size)
+    schema = infer_dataset_schema(
+        records,
+        total_records=total,
+        primary_key_fields=dataset.upsert_keys or [],
+    )
+    latest_run = db.scalar(
+        select(IngestionRun)
+        .where(IngestionRun.dataset_id == dataset_id)
+        .order_by(IngestionRun.created_at.desc())
+        .limit(1)
+    )
+    quality = build_quality_report(
+        records,
+        total_records=total,
+        primary_key_fields=dataset.upsert_keys or [],
+        duplicate_count=latest_run.duplicate_count if latest_run else 0,
+        error_count=latest_run.error_count if latest_run else 0,
+    )
+    publication = db.get(DatasetPublication, dataset_id)
+    publication = await refresh_dataset_publication(
+        request,
+        dataset,
+        publication,
+        db,
+    )
+    return {
+        "dataset": DatasetOut.model_validate(dataset).model_dump(mode="json"),
+        "schema": schema,
+        "quality": quality,
+        "publication": serialize_dataset_publication(
+            dataset_id,
+            publication,
+        ),
+    }
 
 
 @app.get(
@@ -560,7 +1043,8 @@ def dataset_record_changes(
         with db.get_bind().connect() as connection:
             rows = connection.execute(
                 text(
-                    "SELECT id, run_id, fingerprint, data_type, asset_path, "
+                    "SELECT id, run_id, fingerprint, record_key, data_type, "
+                    "asset_path, source_id, source_object, source_locator, "
                     "payload, created_at "
                     f"FROM `{dataset.physical_table}` "
                     f"WHERE {' AND '.join(clauses)} "
@@ -576,12 +1060,25 @@ def dataset_record_changes(
                 "dataset_id": dataset_id,
                 "run_id": row["run_id"],
                 "data_type": row["data_type"],
+                "record_key": row["record_key"],
                 "payload": (
                     json.loads(row["payload"])
                     if isinstance(row["payload"], str)
                     else row["payload"]
                 ),
                 "asset_path": row["asset_path"],
+                "source_id": row["source_id"],
+                "source_object": row["source_object"],
+                "source_locator": (
+                    json.loads(row["source_locator"])
+                    if isinstance(row["source_locator"], str)
+                    else row["source_locator"] or {}
+                ),
+                "stable_record_id": stable_record_id(
+                    dataset_id,
+                    str(row["fingerprint"]),
+                    str(row["record_key"] or ""),
+                ),
                 "created_at": row["created_at"],
             }
             for row in visible_rows
@@ -686,11 +1183,45 @@ def sources(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     return [serialize_source(item) for item in items]
 
 
+@app.post("/api/sources/database-catalog")
+def database_source_catalog(
+    payload: DatabaseCatalogRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    source = db.get(DataSource, payload.source_id) if payload.source_id else None
+    if payload.source_id and source is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    source_type = source.source_type if source is not None else payload.source_type
+    config = resolved_source_config(source) if source is not None else {}
+    config.update(
+        {
+            key: value
+            for key, value in payload.config.items()
+            if value is not None and value != ""
+        }
+    )
+    try:
+        return inspect_database_catalog(
+            source_type,
+            config,
+            table_name=payload.table_name,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"数据库表结构读取失败：{type(error).__name__}: {error}",
+        ) from error
+
+
 @app.post("/api/sources")
 def create_source(
     payload: DataSourceCreate,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    try:
+        validate_source_config(payload.source_type, payload.config)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     source = DataSource(
         name=payload.name,
         source_type=payload.source_type,
@@ -721,6 +1252,10 @@ def update_source(
     if "source_type" in values and values["source_type"] is not None:
         source.source_type = str(values["source_type"])
     if "config" in values and values["config"] is not None:
+        try:
+            validate_source_config(source.source_type, values["config"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         source.config = prepare_source_config_update(
             source.config or {},
             values["config"],
@@ -924,6 +1459,7 @@ async def create_run(
 ) -> dict[str, Any]:
     filename = Path(file.filename or "unnamed").name
     content = await read_upload_bytes(file)
+    source = db.get(DataSource, source_id) if source_id else None
 
     try:
         run = create_ingestion_run(
@@ -934,6 +1470,11 @@ async def create_run(
             template_code=template_code,
             source_id=source_id,
             space_id=current_space_id(request),
+            source_object=source.name if source is not None else filename,
+            source_context={
+                "kind": "file",
+                "filename": filename,
+            },
         )
     except IngestionValidationError as error:
         raise HTTPException(
@@ -971,9 +1512,13 @@ def retry_run(
         template_code=previous.template_code,
         status="queued",
         original_name=previous.original_name,
+        source_object=previous.source_object or previous.original_name,
+        source_context=previous.source_context or {"kind": "file"},
         file_type=previous.file_type,
         media_type=previous.media_type,
         file_size=previous.file_size,
+        incremental_cursor_before=previous.incremental_cursor_before,
+        incremental_cursor_after="",
     )
     db.add(new_run)
     db.flush()
@@ -1018,6 +1563,11 @@ def dataset_records(
                 {
                     **item,
                     "dataset_id": dataset_id,
+                    "stable_record_id": stable_record_id(
+                        dataset_id,
+                        str(item["fingerprint"]),
+                        str(item.get("record_key") or ""),
+                    ),
                 }
                 for item in items
             ],
@@ -1071,4 +1621,43 @@ def download_source_asset(run_id: str, db: Session = Depends(get_db)) -> Respons
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
         },
+    )
+
+
+@app.get("/api/runs/{run_id}/asset/preview")
+def preview_source_asset(run_id: str, db: Session = Depends(get_db)) -> Response:
+    run = db.get(IngestionRun, run_id)
+    if run is None or not run.source_path:
+        raise HTTPException(status_code=404, detail="原始文件不存在")
+    if run.file_type != "image":
+        raise HTTPException(status_code=415, detail="当前资源不是可预览图片")
+    if not storage.exists(run.source_path):
+        raise HTTPException(status_code=404, detail="原始文件已丢失")
+    try:
+        import io
+
+        from PIL import Image, ImageOps
+
+        content = storage.read_bytes(run.source_path)
+        with Image.open(io.BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.seek(0)
+            image.thumbnail((1600, 1600))
+            if image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            ):
+                converted = image.convert("RGBA")
+                background = Image.new("RGB", converted.size, "white")
+                background.paste(converted, mask=converted.getchannel("A"))
+                preview = background
+            else:
+                preview = image.convert("RGB")
+            output = io.BytesIO()
+            preview.save(output, format="JPEG", quality=88, optimize=True)
+    except Exception as error:
+        raise HTTPException(status_code=422, detail="图片预览生成失败") from error
+    return Response(
+        content=output.getvalue(),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
     )

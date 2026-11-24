@@ -17,6 +17,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ControlDatabaseStatusOut'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
   /api/data-ingestion/bootstrap/test:
     post:
       tags:
@@ -24,11 +26,11 @@ paths:
       summary: Test Control Database Connection
       operationId: test_control_database_connection_api_bootstrap_test_post
       requestBody:
-        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/ControlDatabaseBootstrapRequest'
+        required: true
       responses:
         '200':
           description: Successful Response
@@ -36,39 +38,560 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ControlDatabaseTestOut'
-        '400':
-          description: Invalid database configuration
-        '502':
-          description: Database connection failed
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
   /api/data-ingestion/bootstrap/control-database:
     post:
       tags:
       - bootstrap
-      summary: Initialize or Change Control Database
-      description: >-
-        Initializes the control database when none exists, or switches to a
-        different control database. Switching does not migrate or delete data
-        from the previous database.
+      summary: Initialize Control Database
       operationId: initialize_control_database_api_bootstrap_control_database_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControlDatabaseBootstrapRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlDatabaseStatusOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/capabilities/mcp-tools:
+    get:
+      tags:
+      - capabilities
+      summary: List Custom Mcp Tools
+      operationId: list_custom_mcp_tools_api_capabilities_mcp_tools_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  additionalProperties: true
+                  type: object
+                type: array
+                title: Response List Custom Mcp Tools Api Capabilities Mcp Tools Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+    post:
+      tags:
+      - capabilities
+      summary: Create Mcp Tool
+      operationId: create_mcp_tool_api_capabilities_mcp_tools_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpToolCreate'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Create Mcp Tool Api Capabilities Mcp Tools Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/capabilities/mcp-tools/{tool_id}:
+    put:
+      tags:
+      - capabilities
+      summary: Update Mcp Tool
+      operationId: update_mcp_tool_api_capabilities_mcp_tools__tool_id__put
+      parameters:
+      - name: tool_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Tool Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ControlDatabaseBootstrapRequest'
+              $ref: '#/components/schemas/McpToolUpdate'
       responses:
-        '201':
-          description: Control database configured
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ControlDatabaseStatusOut'
-        '400':
-          description: Invalid database configuration
-        '409':
-          description: Control database is managed by deployment configuration
-        '502':
-          description: Control database initialization failed
+                type: object
+                additionalProperties: true
+                title: Response Update Mcp Tool Api Capabilities Mcp Tools  Tool Id  Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - capabilities
+      summary: Delete Mcp Tool
+      operationId: delete_mcp_tool_api_capabilities_mcp_tools__tool_id__delete
+      parameters:
+      - name: tool_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Tool Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/mcp-tools/{tool_id}/execute:
+    post:
+      tags:
+      - capabilities
+      summary: Execute Mcp Tool
+      operationId: execute_mcp_tool_api_capabilities_mcp_tools__tool_id__execute_post
+      parameters:
+      - name: tool_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Tool Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpToolExecuteRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Execute Mcp Tool Api Capabilities Mcp Tools  Tool Id  Execute Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/skills:
+    get:
+      tags:
+      - capabilities
+      summary: List Custom Skills
+      operationId: list_custom_skills_api_capabilities_skills_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  additionalProperties: true
+                  type: object
+                type: array
+                title: Response List Custom Skills Api Capabilities Skills Get
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+    post:
+      tags:
+      - capabilities
+      summary: Create Skill
+      operationId: create_skill_api_capabilities_skills_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillCreate'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Create Skill Api Capabilities Skills Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/capabilities/skills/{skill_id}:
+    put:
+      tags:
+      - capabilities
+      summary: Update Skill
+      operationId: update_skill_api_capabilities_skills__skill_id__put
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Update Skill Api Capabilities Skills  Skill Id  Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - capabilities
+      summary: Delete Skill
+      operationId: delete_skill_api_capabilities_skills__skill_id__delete
+      parameters:
+      - name: skill_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Skill Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/pipeline-executions:
+    post:
+      tags:
+      - capabilities
+      summary: Create Pipeline Execution
+      operationId: create_pipeline_execution_api_capabilities_pipeline_executions_post
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineExecutionCreate'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Create Pipeline Execution Api Capabilities Pipeline Executions Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+    get:
+      tags:
+      - capabilities
+      summary: List Pipeline Executions
+      operationId: list_pipeline_executions_api_capabilities_pipeline_executions_get
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 200
+          title: Limit
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+                title: Response List Pipeline Executions Api Capabilities Pipeline Executions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/pipeline-executions/{execution_id}:
+    patch:
+      tags:
+      - capabilities
+      summary: Update Pipeline Execution
+      operationId: update_pipeline_execution_api_capabilities_pipeline_executions__execution_id__patch
+      parameters:
+      - name: execution_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Execution Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineExecutionUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Update Pipeline Execution Api Capabilities Pipeline Executions  Execution
+                  Id  Patch
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - capabilities
+      summary: Delete Pipeline Execution
+      operationId: delete_pipeline_execution_api_capabilities_pipeline_executions__execution_id__delete
+      parameters:
+      - name: execution_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Execution Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/pipeline-executions/page:
+    get:
+      tags:
+      - capabilities
+      summary: Page Pipeline Executions
+      operationId: page_pipeline_executions_api_capabilities_pipeline_executions_page_get
+      parameters:
+      - name: page
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 1
+          title: Page
+      - name: page_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 100
+          title: Page Size
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Page Pipeline Executions Api Capabilities Pipeline Executions Page Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/pipelines:
+    post:
+      tags:
+      - capabilities
+      summary: Create Pipeline
+      operationId: create_pipeline_api_capabilities_pipelines_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineTemplateCreate'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Create Pipeline Api Capabilities Pipelines Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/capabilities/pipelines/{pipeline_id}:
+    put:
+      tags:
+      - capabilities
+      summary: Update Pipeline
+      operationId: update_pipeline_api_capabilities_pipelines__pipeline_id__put
+      parameters:
+      - name: pipeline_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Pipeline Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineTemplateUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Update Pipeline Api Capabilities Pipelines  Pipeline Id  Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - capabilities
+      summary: Delete Pipeline
+      operationId: delete_pipeline_api_capabilities_pipelines__pipeline_id__delete
+      parameters:
+      - name: pipeline_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Pipeline Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/capabilities/pipelines/{pipeline_id}/run:
+    post:
+      tags:
+      - capabilities
+      summary: Run Pipeline Now
+      operationId: run_pipeline_now_api_capabilities_pipelines__pipeline_id__run_post
+      parameters:
+      - name: pipeline_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Pipeline Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineRunRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Run Pipeline Now Api Capabilities Pipelines  Pipeline Id  Run Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/data-ingestion/agent/status:
     get:
       tags:
@@ -226,6 +749,108 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/messages/stream:
+    post:
+      tags:
+      - agent
+      summary: Send Agent Message Stream
+      operationId: send_agent_message_stream_api_agent_sessions__session_id__messages_stream_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentTurnRequest'
+      responses:
+        '200':
+          description: Server-sent events containing Agent progress and output
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/messages/attachment:
+    post:
+      tags:
+      - agent
+      summary: Send Agent Message With Attachment
+      operationId: send_agent_message_with_attachment_api_agent_sessions__session_id__messages_attachment_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_send_agent_message_with_attachment_api_agent_sessions__session_id__messages_attachment_post'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Send Agent Message With Attachment Api Agent Sessions  Session Id  Messages
+                  Attachment Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/messages/attachment/stream:
+    post:
+      tags:
+      - agent
+      summary: Send Agent Message With Attachment Stream
+      operationId: send_agent_message_with_attachment_stream_api_agent_sessions__session_id__messages_attachment_stream_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_send_agent_message_with_attachment_stream_api_agent_sessions__session_id__messages_attachment_stream_post'
+      responses:
+        '200':
+          description: Server-sent events containing Agent progress and output
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/data-ingestion/agent/sessions/{session_id}/approvals/{approval_id}/approve:
     post:
       tags:
@@ -268,6 +893,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/approvals/{approval_id}/approve/stream:
+    post:
+      tags:
+      - agent
+      summary: Approve Agent Tool Stream
+      operationId: approve_agent_tool_stream_api_agent_sessions__session_id__approvals__approval_id__approve_stream_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Approval Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentApprovalRequest'
+      responses:
+        '200':
+          description: Server-sent events containing Agent progress and output
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/data-ingestion/agent/sessions/{session_id}/approvals/{approval_id}/reject:
     post:
       tags:
@@ -304,6 +968,45 @@ paths:
                 additionalProperties: true
                 title: Response Reject Agent Tool Api Agent Sessions  Session Id  Approvals  Approval
                   Id  Reject Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/agent/sessions/{session_id}/approvals/{approval_id}/reject/stream:
+    post:
+      tags:
+      - agent
+      summary: Reject Agent Tool Stream
+      operationId: reject_agent_tool_stream_api_agent_sessions__session_id__approvals__approval_id__reject_stream_post
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Approval Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentApprovalRequest'
+      responses:
+        '200':
+          description: Server-sent events containing Agent progress and output
+          content:
+            text/event-stream:
+              schema:
+                type: string
         '422':
           description: Validation Error
           content:
@@ -634,6 +1337,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/spaces/{space_id}/catalog-sync:
+    post:
+      tags:
+      - data-spaces
+      summary: Sync Data Space Catalog
+      operationId: sync_data_space_catalog_api_spaces__space_id__catalog_sync_post
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Space Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Sync Data Space Catalog Api Spaces  Space Id  Catalog Sync Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/data-ingestion/health:
     get:
       summary: Health
@@ -765,6 +1496,36 @@ paths:
       parameters:
       - $ref: '#/components/parameters/DataIngestionSpace'
   /api/data-ingestion/datasets/{dataset_id}:
+    put:
+      summary: Update Dataset
+      operationId: update_dataset_api_datasets__dataset_id__put
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
     get:
       summary: Dataset Detail
       operationId: dataset_detail_api_datasets__dataset_id__get
@@ -783,6 +1544,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DatasetOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      summary: Delete Dataset
+      operationId: delete_dataset_api_datasets__dataset_id__delete
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
         '422':
           description: Validation Error
           content:
@@ -817,6 +1598,248 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DatasetSchemaOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/quality:
+    get:
+      summary: Dataset Quality
+      operationId: dataset_quality_api_datasets__dataset_id__quality_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - name: sample_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 500
+          minimum: 1
+          default: 200
+          title: Sample Size
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Dataset Quality Api Datasets  Dataset Id  Quality Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/quality-checks:
+    post:
+      summary: Create Full Quality Check
+      operationId: create_full_quality_check_api_datasets__dataset_id__quality_checks_post
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Create Full Quality Check Api Datasets  Dataset Id  Quality Checks Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/quality-checks/latest:
+    get:
+      summary: Latest Full Quality Check
+      operationId: latest_full_quality_check_api_datasets__dataset_id__quality_checks_latest_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Latest Full Quality Check Api Datasets  Dataset Id  Quality Checks Latest
+                  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/quality-checks/{check_id}:
+    get:
+      summary: Full Quality Check
+      operationId: full_quality_check_api_datasets__dataset_id__quality_checks__check_id__get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - name: check_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Check Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Full Quality Check Api Datasets  Dataset Id  Quality Checks  Check Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/provenance/backfill:
+    post:
+      summary: Backfill Dataset Provenance
+      operationId: backfill_dataset_provenance_api_datasets__dataset_id__provenance_backfill_post
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Backfill Dataset Provenance Api Datasets  Dataset Id  Provenance Backfill
+                  Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/publication:
+    get:
+      summary: Dataset Publication
+      operationId: dataset_publication_api_datasets__dataset_id__publication_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Dataset Publication Api Datasets  Dataset Id  Publication Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/publish:
+    post:
+      summary: Publish Dataset
+      operationId: publish_dataset_api_datasets__dataset_id__publish_post
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Publish Dataset Api Datasets  Dataset Id  Publish Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/datasets/{dataset_id}/contract:
+    get:
+      summary: Dataset Contract
+      operationId: dataset_contract_api_datasets__dataset_id__contract_get
+      parameters:
+      - name: dataset_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Dataset Id
+      - name: sample_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 500
+          minimum: 1
+          default: 200
+          title: Sample Size
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Dataset Contract Api Datasets  Dataset Id  Contract Get
         '422':
           description: Validation Error
           content:
@@ -949,6 +1972,86 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       parameters:
       - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/sources/database-catalog:
+    post:
+      summary: Database Source Catalog
+      operationId: database_source_catalog_api_sources_database_catalog_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatabaseCatalogRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Database Source Catalog Api Sources Database Catalog Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      parameters:
+      - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/sources/{source_id}:
+    put:
+      summary: Update Source
+      operationId: update_source_api_sources__source_id__put
+      parameters:
+      - name: source_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Source Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataSourceUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Update Source Api Sources  Source Id  Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      summary: Delete Source
+      operationId: delete_source_api_sources__source_id__delete
+      parameters:
+      - name: source_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Source Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/data-ingestion/sources/{source_id}/test:
     post:
       summary: Test Source
@@ -1049,6 +2152,60 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       parameters:
       - $ref: '#/components/parameters/DataIngestionSpace'
+  /api/data-ingestion/runs/page:
+    get:
+      summary: Runs Page
+      operationId: runs_page_api_runs_page_get
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+      - name: dataset_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Dataset Id
+      - name: page
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+          title: Page
+      - name: page_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 100
+          title: Page Size
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Runs Page Api Runs Page Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/data-ingestion/runs/{run_id}:
     get:
       summary: Run Detail
@@ -1070,6 +2227,26 @@ paths:
                 type: object
                 additionalProperties: true
                 title: Response Run Detail Api Runs  Run Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      summary: Delete Run
+      operationId: delete_run_api_runs__run_id__delete
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '204':
+          description: Successful Response
         '422':
           description: Validation Error
           content:
@@ -1184,6 +2361,30 @@ paths:
     get:
       summary: Download Source Asset
       operationId: download_source_asset_api_runs__run_id__asset_get
+      parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Run Id
+      - $ref: '#/components/parameters/DataIngestionSpace'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/data-ingestion/runs/{run_id}/asset/preview:
+    get:
+      summary: Preview Source Asset
+      operationId: preview_source_asset_api_runs__run_id__asset_preview_get
       parameters:
       - name: run_id
         in: path
@@ -1402,6 +2603,14 @@ components:
           type: string
           title: Data Type
           default: mixed
+        storage_mode:
+          type: string
+          title: Storage Mode
+          default: auto
+        upsert_keys:
+          type: string
+          title: Upsert Keys
+          default: ''
       type: object
       required:
       - name
@@ -1439,6 +2648,34 @@ components:
       required:
       - file
       title: Body_inspect_upload_api_uploads_inspect_post
+    Body_send_agent_message_with_attachment_api_agent_sessions__session_id__messages_attachment_post:
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: File
+        content:
+          type: string
+          title: Content
+          default: ''
+      type: object
+      required:
+      - file
+      title: Body_send_agent_message_with_attachment_api_agent_sessions__session_id__messages_attachment_post
+    Body_send_agent_message_with_attachment_stream_api_agent_sessions__session_id__messages_attachment_stream_post:
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          title: File
+        content:
+          type: string
+          title: Content
+          default: ''
+      type: object
+      required:
+      - file
+      title: Body_send_agent_message_with_attachment_stream_api_agent_sessions__session_id__messages_attachment_stream_post
     ControlDatabaseBootstrapRequest:
       properties:
         database_url:
@@ -1527,6 +2764,26 @@ components:
       required:
       - name
       title: DataSourceCreate
+    DataSourceUpdate:
+      properties:
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        source_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Type
+        config:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Config
+      type: object
+      title: DataSourceUpdate
     DataSpaceCreate:
       properties:
         name:
@@ -1589,6 +2846,27 @@ components:
       - last_error
       - created_at
       title: DataSpaceOut
+    DatabaseCatalogRequest:
+      properties:
+        source_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Id
+        source_type:
+          type: string
+          title: Source Type
+          default: mysql
+        config:
+          additionalProperties: true
+          type: object
+          title: Config
+        table_name:
+          type: string
+          title: Table Name
+          default: ''
+      type: object
+      title: DatabaseCatalogRequest
     DatasetFieldSchema:
       properties:
         name:
@@ -1600,11 +2878,28 @@ components:
         nullable:
           type: boolean
           title: Nullable
+        present_count:
+          type: integer
+          title: Present Count
+        completeness:
+          type: number
+          title: Completeness
+        sample_values:
+          items: {}
+          type: array
+          title: Sample Values
+        primary_key:
+          type: boolean
+          title: Primary Key
       type: object
       required:
       - name
       - data_type
       - nullable
+      - present_count
+      - completeness
+      - sample_values
+      - primary_key
       title: DatasetFieldSchema
     DatasetOut:
       properties:
@@ -1626,6 +2921,20 @@ components:
         target_table:
           type: string
           title: Target Table
+        storage_mode:
+          type: string
+          title: Storage Mode
+        upsert_keys:
+          items:
+            type: string
+          type: array
+          title: Upsert Keys
+        physical_table:
+          type: string
+          title: Physical Table
+        partition_mode:
+          type: string
+          title: Partition Mode
         record_count:
           type: integer
           title: Record Count
@@ -1647,6 +2956,10 @@ components:
       - description
       - data_type
       - target_table
+      - storage_mode
+      - upsert_keys
+      - physical_table
+      - partition_mode
       - record_count
       - last_ingested_at
       - created_at
@@ -1683,6 +2996,9 @@ components:
         run_id:
           type: string
           title: Run Id
+        record_key:
+          type: string
+          title: Record Key
         data_type:
           type: string
           title: Data Type
@@ -1693,6 +3009,23 @@ components:
         asset_path:
           type: string
           title: Asset Path
+        source_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source Id
+        source_object:
+          type: string
+          title: Source Object
+        source_locator:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Source Locator
+        stable_record_id:
+          type: string
+          title: Stable Record Id
         created_at:
           type: string
           format: date-time
@@ -1702,9 +3035,14 @@ components:
       - id
       - dataset_id
       - run_id
+      - record_key
       - data_type
       - payload
       - asset_path
+      - source_id
+      - source_object
+      - source_locator
+      - stable_record_id
       - created_at
       title: DatasetRecordOut
     DatasetSchemaOut:
@@ -1718,6 +3056,14 @@ components:
         total_records:
           type: integer
           title: Total Records
+        primary_key_fields:
+          items:
+            type: string
+          type: array
+          title: Primary Key Fields
+        stable_key_strategy:
+          type: string
+          title: Stable Key Strategy
         fields:
           items:
             $ref: '#/components/schemas/DatasetFieldSchema'
@@ -1728,8 +3074,39 @@ components:
       - schema_version
       - sampled_records
       - total_records
+      - primary_key_fields
+      - stable_key_strategy
       - fields
       title: DatasetSchemaOut
+    DatasetUpdate:
+      properties:
+        name:
+          anyOf:
+          - type: string
+            maxLength: 120
+            minLength: 1
+          - type: 'null'
+          title: Name
+        description:
+          anyOf:
+          - type: string
+            maxLength: 4000
+          - type: 'null'
+          title: Description
+        data_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Data Type
+        upsert_keys:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Upsert Keys
+      type: object
+      title: DatasetUpdate
     HTTPValidationError:
       properties:
         detail:
@@ -1797,6 +3174,240 @@ components:
       - metadata
       - warnings
       title: InspectionOut
+    McpToolCreate:
+      properties:
+        name:
+          type: string
+          maxLength: 80
+          minLength: 2
+          pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
+          title: Name
+        display_name:
+          type: string
+          maxLength: 120
+          minLength: 1
+          title: Display Name
+        description:
+          type: string
+          maxLength: 4000
+          title: Description
+          default: ''
+        read_only:
+          type: boolean
+          title: Read Only
+          default: true
+        requires_approval:
+          type: boolean
+          title: Requires Approval
+          default: true
+        tool_type:
+          type: string
+          pattern: ^http$
+          title: Tool Type
+          default: http
+        config:
+          additionalProperties: true
+          type: object
+          title: Config
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+      type: object
+      required:
+      - name
+      - display_name
+      - config
+      title: McpToolCreate
+    McpToolExecuteRequest:
+      properties:
+        arguments:
+          additionalProperties: true
+          type: object
+          title: Arguments
+      type: object
+      title: McpToolExecuteRequest
+    McpToolUpdate:
+      properties:
+        display_name:
+          anyOf:
+          - type: string
+            maxLength: 120
+            minLength: 1
+          - type: 'null'
+          title: Display Name
+        description:
+          anyOf:
+          - type: string
+            maxLength: 4000
+          - type: 'null'
+          title: Description
+        read_only:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Read Only
+        requires_approval:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Requires Approval
+        config:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Config
+        enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enabled
+      type: object
+      title: McpToolUpdate
+    PipelineExecutionCreate:
+      properties:
+        pipeline_code:
+          type: string
+          maxLength: 64
+          minLength: 1
+          title: Pipeline Code
+        pipeline_name:
+          type: string
+          maxLength: 120
+          minLength: 1
+          title: Pipeline Name
+        inputs:
+          additionalProperties: true
+          type: object
+          title: Inputs
+        step_inputs:
+          additionalProperties:
+            additionalProperties: true
+            type: object
+          type: object
+          title: Step Inputs
+      type: object
+      required:
+      - pipeline_code
+      - pipeline_name
+      title: PipelineExecutionCreate
+    PipelineExecutionUpdate:
+      properties:
+        status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+        results:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Results
+        error_message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error Message
+      type: object
+      title: PipelineExecutionUpdate
+    PipelineRunRequest:
+      properties:
+        inputs:
+          additionalProperties: true
+          type: object
+          title: Inputs
+        step_inputs:
+          additionalProperties:
+            additionalProperties: true
+            type: object
+          type: object
+          title: Step Inputs
+      type: object
+      title: PipelineRunRequest
+    PipelineTemplateCreate:
+      properties:
+        code:
+          type: string
+          maxLength: 64
+          minLength: 3
+          pattern: ^user-[a-zA-Z0-9][a-zA-Z0-9_-]*$
+          title: Code
+        name:
+          type: string
+          maxLength: 120
+          minLength: 1
+          title: Name
+        description:
+          type: string
+          maxLength: 4000
+          title: Description
+          default: ''
+        supported_types:
+          items:
+            type: string
+          type: array
+          title: Supported Types
+        steps:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          maxItems: 50
+          minItems: 1
+          title: Steps
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+      type: object
+      required:
+      - code
+      - name
+      - steps
+      title: PipelineTemplateCreate
+    PipelineTemplateUpdate:
+      properties:
+        name:
+          anyOf:
+          - type: string
+            maxLength: 120
+            minLength: 1
+          - type: 'null'
+          title: Name
+        description:
+          anyOf:
+          - type: string
+            maxLength: 4000
+          - type: 'null'
+          title: Description
+        supported_types:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Supported Types
+        steps:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+            maxItems: 50
+            minItems: 1
+          - type: 'null'
+          title: Steps
+        enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enabled
+      type: object
+      title: PipelineTemplateUpdate
     RunListItem:
       properties:
         id:
@@ -1822,6 +3433,9 @@ components:
         file_type:
           type: string
           title: File Type
+        source_object:
+          type: string
+          title: Source Object
         file_size:
           type: integer
           title: File Size
@@ -1831,12 +3445,21 @@ components:
         inserted_count:
           type: integer
           title: Inserted Count
+        updated_count:
+          type: integer
+          title: Updated Count
         duplicate_count:
           type: integer
           title: Duplicate Count
         error_count:
           type: integer
           title: Error Count
+        incremental_cursor_before:
+          type: string
+          title: Incremental Cursor Before
+        incremental_cursor_after:
+          type: string
+          title: Incremental Cursor After
         error_message:
           type: string
           title: Error Message
@@ -1865,11 +3488,15 @@ components:
       - status
       - original_name
       - file_type
+      - source_object
       - file_size
       - fetched_count
       - inserted_count
+      - updated_count
       - duplicate_count
       - error_count
+      - incremental_cursor_before
+      - incremental_cursor_after
       - error_message
       - started_at
       - finished_at
@@ -1920,6 +3547,68 @@ components:
       - metadata
       - warnings
       title: SheetPreview
+    SkillCreate:
+      properties:
+        name:
+          type: string
+          maxLength: 80
+          minLength: 2
+          pattern: ^[a-zA-Z][a-zA-Z0-9_-]*$
+          title: Name
+        display_name:
+          type: string
+          maxLength: 120
+          minLength: 1
+          title: Display Name
+        description:
+          type: string
+          maxLength: 4000
+          title: Description
+          default: ''
+        content:
+          type: string
+          maxLength: 100000
+          minLength: 1
+          title: Content
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+      type: object
+      required:
+      - name
+      - display_name
+      - content
+      title: SkillCreate
+    SkillUpdate:
+      properties:
+        display_name:
+          anyOf:
+          - type: string
+            maxLength: 120
+            minLength: 1
+          - type: 'null'
+          title: Display Name
+        description:
+          anyOf:
+          - type: string
+            maxLength: 4000
+          - type: 'null'
+          title: Description
+        content:
+          anyOf:
+          - type: string
+            maxLength: 100000
+            minLength: 1
+          - type: 'null'
+          title: Content
+        enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enabled
+      type: object
+      title: SkillUpdate
     TemplateOut:
       properties:
         id:
