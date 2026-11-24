@@ -112,6 +112,14 @@ export type ImportReport = {
   writeMode?: ImportWriteMode;
   watermark?: ImportWatermark;
   sourceLabel?: string;
+  sourceKind?: "file" | "dataset" | "table";
+  sourceName?: string;
+  mappingSummary?: Array<{
+    objectTypeId: string;
+    objectTypeName: string;
+    primaryKeyProperty?: string;
+    fields: Array<{ sourceColumn: string; propertyName: string; type?: string }>;
+  }>;
   error?: string;
 };
 
@@ -757,7 +765,12 @@ export async function suggestMappingByProfile(
   return { profile, objectTypes: detailed, mapping: { objects }, warnings };
 }
 
-type ImportSource = { datasetId?: string; sourceLabel: string };
+type ImportSource = {
+  datasetId?: string;
+  sourceLabel: string;
+  sourceKind?: "file" | "dataset" | "table";
+  sourceName?: string;
+};
 
 function watermarkText(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -849,6 +862,20 @@ async function runImport(
     writeMode,
     watermark: writeMode === "upsert" ? watermark : undefined,
     sourceLabel: source.sourceLabel,
+    sourceKind: source.sourceKind,
+    sourceName: source.sourceName,
+    mappingSummary: mapping.objects.map((objectMapping) => ({
+      objectTypeId: objectMapping.objectTypeId,
+      objectTypeName: objectMapping.objectTypeName,
+      primaryKeyProperty: objectMapping.fields.find(
+        (field) => field.sourceColumn === objectMapping.primaryKeyColumn,
+      )?.propertyName,
+      fields: objectMapping.fields.map((field) => ({
+        sourceColumn: field.sourceColumn,
+        propertyName: field.propertyName,
+        type: field.type,
+      })),
+    })),
   };
   try {
     const transformed = transformRecords(filtered, mapping);
@@ -986,6 +1013,8 @@ export async function importDataset(
   return runImport(token, networkId, mapping, collected, {
     datasetId: dataset.id,
     sourceLabel: `数据集「${dataset.name}」`,
+    sourceKind: "dataset",
+    sourceName: dataset.name,
   }, options);
 }
 
@@ -1019,6 +1048,8 @@ export async function importFileRecords(
   }
   return runImport(token, networkId, mapping, first.records, {
     sourceLabel: `文件「${fileName}」`,
+    sourceKind: "file",
+    sourceName: fileName,
   }, options);
 }
 
@@ -1281,7 +1312,7 @@ function appendHistory(report: ImportReport): void {
 }
 
 export function listImportHistory(): ImportReport[] {
-  return readHistoryFile().slice(0, 50);
+  return readHistoryFile().slice(0, 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,5 +1513,176 @@ export async function importTableRecords(
   return runImport(token, networkId, mapping, rows, {
     datasetId: `${catalogId}:${tableName}`,
     sourceLabel: `数据库表 ${tableName}`,
+    sourceKind: "table",
+    sourceName: tableName,
   }, options);
+}
+
+// ---------------------------------------------------------------------------
+// 数据溯源：对象类型 -> 数据资源 -> 来源（文件 / 数据集 / 库表） -> 批次与字段映射
+// ---------------------------------------------------------------------------
+
+export type ProvenanceField = {
+  propertyName: string;
+  sourceColumn?: string;
+  type?: string;
+  mapped?: boolean;
+};
+
+export type ProvenanceObject = {
+  objectTypeId: string;
+  objectTypeName: string;
+  resourceId?: string;
+  resourceName?: string;
+  bound: boolean;
+  sourceLabel?: string;
+  sourceKind?: "file" | "dataset" | "table";
+  sourceName?: string;
+  importedAt?: string;
+  writeMode?: ImportWriteMode;
+  written?: number;
+  fields: ProvenanceField[];
+};
+
+export type ProvenanceBatch = {
+  sourceLabel: string;
+  sourceKind?: "file" | "dataset" | "table";
+  sourceName?: string;
+  writeMode?: ImportWriteMode;
+  finishedAt?: string;
+  elapsedMs?: number;
+  written: number;
+  failed: number;
+  objects: Array<{ objectTypeName: string; written: number; failed: number }>;
+  relations: Array<{ relationTypeName: string; edgeCount: number }>;
+};
+
+export type ProvenanceRelation = {
+  relationTypeId: string;
+  relationTypeName: string;
+  sourceObjectTypeId?: string;
+  targetObjectTypeId?: string;
+  sourceProperty?: string;
+  targetProperty?: string;
+  edgeCount?: number;
+};
+
+export type NetworkProvenance = {
+  networkId: string;
+  generatedAt: string;
+  objects: ProvenanceObject[];
+  batches: ProvenanceBatch[];
+  relations: ProvenanceRelation[];
+};
+
+async function resolveResourceName(token: string, resourceId: string): Promise<string> {
+  try {
+    const payload = await getJson<{ entry?: { name?: string }; name?: string }>(
+      token,
+      `${GATEWAY_BASE}/api/vega-backend/v1/resources/${encodeURIComponent(resourceId)}`,
+    );
+    const entry = payload.entry ?? payload;
+    return String(entry?.name ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+export async function buildNetworkProvenance(
+  token: string,
+  networkId: string,
+): Promise<NetworkProvenance> {
+  const objectTypes = await listObjectTypes(token, networkId);
+  const history = listImportHistory().filter((item) => item.networkId === networkId);
+  const latestByObjectType = new Map<string, ImportReport>();
+  for (const item of history) {
+    for (const obj of item.objects ?? []) {
+      const key = `${item.networkId}:${obj.objectTypeId}`;
+      if (!latestByObjectType.has(key)) latestByObjectType.set(key, item);
+    }
+  }
+  const objects: ProvenanceObject[] = await Promise.all(
+    objectTypes.map(async (objectType) => {
+    const latest = latestByObjectType.get(`${networkId}:${objectType.id}`);
+    const summary = latest?.mappingSummary?.find((item) => item.objectTypeId === objectType.id);
+    const objectReport = latest?.objects?.find((item) => item.objectTypeId === objectType.id);
+    const dataSource = objectType.data_source;
+    const resourceId =
+      dataSource?.type === "resource" && dataSource.id ? dataSource.id : objectReport?.resourceId;
+    const historicalName =
+      objectReport?.resourceName && objectReport.resourceName !== resourceId
+        ? objectReport.resourceName
+        : "";
+    const resourceName =
+      dataSource?.type === "resource" && dataSource.name
+        ? dataSource.name
+        : historicalName ||
+          (resourceId ? (await resolveResourceName(token, resourceId)) || resourceId : "");
+    const fields: ProvenanceField[] =
+      summary?.fields.map((field) => ({
+        propertyName: field.propertyName,
+        sourceColumn: field.sourceColumn,
+        type: field.type,
+        mapped: true,
+      })) ??
+      (objectType.data_properties ?? []).map((property) => ({
+        propertyName: property.name,
+        sourceColumn: property.mapped_field?.name,
+        type: property.type,
+        mapped: Boolean(property.mapped_field?.name),
+      }));
+    return {
+      objectTypeId: objectType.id,
+      objectTypeName: objectType.name ?? objectType.id,
+      resourceId,
+      resourceName,
+      bound: Boolean(resourceId),
+      sourceLabel: latest?.sourceLabel,
+      sourceKind: latest?.sourceKind,
+      sourceName: latest?.sourceName,
+      importedAt: latest?.finishedAt,
+      writeMode: latest?.writeMode,
+      written: objectReport?.written,
+      fields,
+    };
+    }),
+  );
+  const batches: ProvenanceBatch[] = history.slice(0, 20).map((item) => ({
+    sourceLabel: item.sourceLabel ?? "",
+    sourceKind: item.sourceKind,
+    sourceName: item.sourceName,
+    writeMode: item.writeMode,
+    finishedAt: item.finishedAt,
+    elapsedMs: item.elapsedMs,
+    written: (item.objects ?? []).reduce((sum, obj) => sum + (obj.written ?? 0), 0),
+    failed: (item.objects ?? []).reduce((sum, obj) => sum + (obj.failed ?? 0), 0),
+    objects: (item.objects ?? []).map((obj) => ({
+      objectTypeName: obj.objectTypeName,
+      written: obj.written ?? 0,
+      failed: obj.failed ?? 0,
+    })),
+    relations: (item.relations ?? []).map((relation) => ({
+      relationTypeName: relation.relationTypeName,
+      edgeCount: relation.edgeCount,
+    })),
+  }));
+  const relationMappings = await listRelationMappings(token, networkId).catch(() => [] as RelationMappingInfo[]);
+  const latestEdges = new Map<string, number>();
+  for (const item of history) {
+    for (const relation of item.relations ?? []) {
+      if (!latestEdges.has(relation.relationTypeId)) {
+        latestEdges.set(relation.relationTypeId, relation.edgeCount);
+      }
+    }
+  }
+  const relations: ProvenanceRelation[] = relationMappings.map((item) => ({
+    relationTypeId: item.id,
+    relationTypeName: item.name,
+    sourceObjectTypeId: item.sourceObjectTypeId,
+    targetObjectTypeId: item.targetObjectTypeId,
+    sourceProperty: item.sourceProperty,
+    targetProperty: item.targetProperty,
+    edgeCount: latestEdges.get(item.id),
+  }));
+  return { networkId, generatedAt: new Date().toISOString(), objects, batches, relations };
 }

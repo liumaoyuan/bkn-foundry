@@ -63,6 +63,7 @@ import {
   suggestMapping,
   suggestMappingByProfile,
   transformRecords,
+  buildNetworkProvenance,
   findLastImport,
   listRelationMappings,
   updateRelationMapping,
@@ -430,6 +431,18 @@ export async function copilotRoutes(app: FastifyInstance) {
   });
 
   app.get("/data/imports", async () => ({ ok: true, items: listImportHistory() }));
+
+  app.get("/data/provenance", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能查看数据溯源" });
+    const networkId = String((request.query as { networkId?: string }).networkId ?? "").trim();
+    if (!networkId) return reply.code(400).send({ ok: false, error: "缺少 networkId" });
+    try {
+      return { ok: true, provenance: await buildNetworkProvenance(token, networkId) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
 
   app.get("/data/relation-mappings", async (request, reply) => {
     const token = readToken(request as unknown as { headers: Record<string, unknown> });
