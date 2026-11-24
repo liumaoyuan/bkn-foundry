@@ -1283,7 +1283,7 @@ async function collectReportRelations(
         base.note = "两端数据的主键/连接字段未匹配，暂无可关联实例";
       }
     } catch (error) {
-      base.note = `关系边统计失败：${(error as Error).message}`;
+      base.note = "暂无法统计关系边（连接字段未匹配或代理同步中）";
     }
     results.push(base);
   }
