@@ -16,6 +16,7 @@ import { attachEvidence, type EvidenceSource } from "../evidence.js";
 import { dedupeRelations, dedupeWarning } from "../relations.js";
 import {
   extractDocument,
+  extractRecords,
   extractTables,
   type ExtractedTable,
   type ExtractHealth,
@@ -35,12 +36,40 @@ import {
   type Schema,
 } from "../schema.js";
 import {
+  chatWithDraftPlatformStream,
   chatWithDraftStream,
   extractIrFromSchema,
   extractIrWithLlm,
+  extractIrWithPlatform,
   isLlmConfigured,
+  readModelSettings,
   testLlmConnection,
+  testPlatformConnection,
 } from "../llm.js";
+import { listPlatformModels, type PlatformModel } from "../platform-model.js";
+import {
+  fetchDatasetRecords,
+  importDataset,
+  importFileRecords,
+  importTableRecords,
+  listConnectionTables,
+  listDataConnections,
+  previewTable,
+  listDataDatasets,
+  listDataSpaces,
+  listImportHistory,
+  profileDataset,
+  profileRecords,
+  suggestMapping,
+  suggestMappingByProfile,
+  transformRecords,
+  findLastImport,
+  listRelationMappings,
+  updateRelationMapping,
+  watermarkCandidates,
+  type ImportMapping,
+  type ImportOptions,
+} from "../data-import.js";
 import {
   clearStoredSettings,
   isHttpUrl,
@@ -65,6 +94,9 @@ type AnalyzeJsonBody = {
 };
 
 type SettingsBody = {
+  mode?: string;
+  platformModel?: string;
+  platformModelName?: string;
   baseUrl?: string;
   model?: string;
   apiKey?: string;
@@ -208,27 +240,479 @@ function settingsSummary() {
   return {
     ok: true,
     source,
+    mode: settings?.mode ?? "none",
+    platformModel: settings?.platformModel ?? "",
+    platformModelName: settings?.platformModelName ?? "",
     baseUrl: settings?.baseUrl ?? "",
     model: settings?.model ?? "",
-    apiKeyMasked: settings ? maskApiKey(settings.apiKey) : "",
+    apiKeyMasked: settings?.apiKey ? maskApiKey(settings.apiKey) : "",
   };
+}
+
+/** 从请求头取当前登录用户的访问令牌（平台模型模式需要透传）。 */
+function readToken(request: { headers: Record<string, unknown> }): string {
+  const raw = request.headers.authorization;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== "string" || !value.trim()) {
+    return "";
+  }
+  return value.replace(/^Bearer\s+/i, "").trim();
+}
+
+/** 平台模式是否已就绪（有模型 + 有 token）。 */
+function platformReady(token: string): boolean {
+  const settings = readModelSettings();
+  return Boolean(token && settings && settings.mode === "platform" && settings.platformModel);
 }
 
 export async function copilotRoutes(app: FastifyInstance) {
   app.get("/health", async () => {
-    const { source } = resolveSettings();
+    const { source, settings } = resolveSettings();
     return {
       ok: true,
       mode: isLlmConfigured() ? "llm" : "heuristic",
       settingsSource: source,
+      modelMode: settings?.mode ?? "none",
+      platformModel: settings?.platformModel ?? "",
     };
   });
 
+  // ---- 平台「模型配置」里已配置的模型清单（透传当前登录用户 token） ----
+  app.get("/platform-models", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) {
+      reply.code(401);
+      return { ok: false, error: "需要登录平台后才能读取平台模型列表" };
+    }
+    try {
+      const models: PlatformModel[] = await listPlatformModels(token);
+      return { ok: true, models };
+    } catch (error) {
+      reply.code(502);
+      return { ok: false, error: error instanceof Error ? error.message : "读取平台模型失败" };
+    }
+  });
+
   // ---- 模型连接配置（只在本机服务端读写，key 不下发浏览器） ----
+  const dataImportError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+  const readSpaceId = (request: unknown): string => {
+    const query = (request as { query?: Record<string, unknown> }).query ?? {};
+    return typeof query.spaceId === "string" && query.spaceId.length > 0 ? query.spaceId : "default";
+  };
+
+  app.get("/data/spaces", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能读取数据空间" });
+    try {
+      return { ok: true, spaces: await listDataSpaces(token) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.get("/data/datasets", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能读取数据集" });
+    try {
+      return { ok: true, datasets: await listDataDatasets(token, readSpaceId(request)) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.get("/data/datasets/:datasetId/profile", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能读取数据集" });
+    const params = request.params as { datasetId?: string };
+    const spaceId = readSpaceId(request);
+    try {
+      const datasets = await listDataDatasets(token, spaceId);
+      const dataset = datasets.find((item) => item.id === params.datasetId);
+      if (!dataset) return reply.code(404).send({ ok: false, error: "数据集不存在" });
+      return { ok: true, profile: await profileDataset(token, spaceId, dataset) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.post("/data/preview", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const body = (request.body ?? {}) as {
+      spaceId?: string;
+      datasetId?: string;
+      networkId?: string;
+      mapping?: ImportMapping;
+    };
+    if (!body.datasetId || !body.networkId) {
+      return reply.code(400).send({ ok: false, error: "缺少 datasetId 或 networkId" });
+    }
+    const spaceId = body.spaceId ?? "default";
+    try {
+      const datasets = await listDataDatasets(token, spaceId);
+      const dataset = datasets.find((item) => item.id === body.datasetId);
+      if (!dataset) return reply.code(404).send({ ok: false, error: "数据集不存在" });
+      let mapping = body.mapping;
+      let warnings: string[] = [];
+      let objectTypes: Array<{ id: string; name: string; properties: Array<{ name: string; displayName: string; type: string }> }> = [];
+      if (!mapping || mapping.objects.length === 0) {
+        const suggestion = await suggestMapping(token, spaceId, dataset, body.networkId);
+        mapping = suggestion.mapping;
+        warnings = suggestion.warnings;
+        objectTypes = suggestion.objectTypes;
+      }
+      const page = await fetchDatasetRecords(token, spaceId, dataset.id, 1, 50);
+      const transformed = transformRecords(page.items, mapping);
+      const datasetLabel = `数据集「${dataset.name}」`;
+      return {
+        ok: true,
+        dataset,
+        mapping,
+        objectTypes,
+        warnings,
+        watermarkCandidates: watermarkCandidates({
+          dataset: {
+            id: dataset.id,
+            name: dataset.name,
+            description: dataset.description ?? "",
+            dataType: dataset.dataType,
+            recordCount: dataset.recordCount,
+            targetTable: dataset.targetTable,
+          },
+          total: dataset.recordCount ?? 0,
+          sampled: page.items.length,
+          fields: profileRecords(page.items),
+        }),
+        lastImport: findLastImport(body.networkId, datasetLabel),
+        stats: transformed.stats,
+        documents: Object.fromEntries(
+          Object.entries(transformed.documents).map(([key, docs]) => [key, docs.slice(0, 10)]),
+        ),
+        issues: transformed.issues.slice(0, 50),
+      };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.post("/data/import", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const body = (request.body ?? {}) as {
+      spaceId?: string;
+      datasetId?: string;
+      networkId?: string;
+      mapping?: ImportMapping;
+      writeMode?: string;
+      watermarkField?: string;
+      watermarkValue?: string;
+    };
+    if (!body.datasetId || !body.networkId || !body.mapping || body.mapping.objects.length === 0) {
+      return reply.code(400).send({ ok: false, error: "缺少 datasetId / networkId / mapping" });
+    }
+    const spaceId = body.spaceId ?? "default";
+    try {
+      const datasets = await listDataDatasets(token, spaceId);
+      const dataset = datasets.find((item) => item.id === body.datasetId);
+      if (!dataset) return reply.code(404).send({ ok: false, error: "数据集不存在" });
+      const report = await importDataset(
+        token,
+        spaceId,
+        dataset,
+        body.networkId,
+        body.mapping,
+        readImportOptions(body),
+      );
+      return { ok: report.ok, report };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.get("/data/imports", async () => ({ ok: true, items: listImportHistory() }));
+
+  app.get("/data/relation-mappings", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const networkId = String((request.query as { networkId?: string }).networkId ?? "").trim();
+    if (!networkId) return reply.code(400).send({ ok: false, error: "缺少 networkId" });
+    try {
+      return { ok: true, items: await listRelationMappings(token, networkId) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.post("/data/relation-mapping", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const body = (request.body ?? {}) as {
+      networkId?: string;
+      relationTypeId?: string;
+      sourceProperty?: string;
+      targetProperty?: string;
+    };
+    const networkId = String(body.networkId ?? "").trim();
+    const relationTypeId = String(body.relationTypeId ?? "").trim();
+    const sourceProperty = String(body.sourceProperty ?? "").trim();
+    const targetProperty = String(body.targetProperty ?? "").trim();
+    if (!networkId || !relationTypeId || !sourceProperty || !targetProperty) {
+      return reply
+        .code(400)
+        .send({ ok: false, error: "缺少 networkId / relationTypeId / sourceProperty / targetProperty" });
+    }
+    try {
+      const item = await updateRelationMapping(token, networkId, relationTypeId, sourceProperty, targetProperty);
+      return { ok: true, item };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  type UploadedFile = { fileName: string; buffer: Buffer };
+
+  const readMultipart = async (
+    request: { parts: () => AsyncIterable<unknown> },
+  ): Promise<{ file?: UploadedFile; fields: Record<string, string> }> => {
+    const fields: Record<string, string> = {};
+    let file: UploadedFile | undefined;
+    for await (const raw of request.parts()) {
+      const part = raw as {
+        type: string;
+        fieldname: string;
+        filename?: string;
+        value?: unknown;
+        toBuffer?: () => Promise<Buffer>;
+      };
+      if (part.type === "file" && typeof part.toBuffer === "function") {
+        if (!file && part.filename) {
+          file = { fileName: part.filename, buffer: await part.toBuffer() };
+        } else {
+          await part.toBuffer();
+        }
+        continue;
+      }
+      if (part.type === "field" && typeof part.value === "string") {
+        fields[part.fieldname] = part.value;
+      }
+    }
+    return { file, fields };
+  };
+
+  const readImportOptions = (body: {
+    writeMode?: string;
+    watermarkField?: string;
+    watermarkValue?: string;
+  }): ImportOptions => {
+    const writeMode = body.writeMode === "upsert" ? "upsert" : "replace";
+    const field = String(body.watermarkField ?? "").trim();
+    const value = String(body.watermarkValue ?? "").trim();
+    if (writeMode !== "upsert") return { writeMode };
+    return { writeMode, watermark: field ? { field, value: value || undefined } : undefined };
+  };
+
+  app.post("/data/file/preview", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    try {
+      const { file, fields } = await readMultipart(
+        request as unknown as { parts: () => AsyncIterable<unknown> },
+      );
+      const networkId = (fields.networkId ?? "").trim();
+      if (!file) return reply.code(400).send({ ok: false, error: "缺少上传文件" });
+      if (!networkId) return reply.code(400).send({ ok: false, error: "缺少 networkId" });
+      const tables = await extractRecords(file.fileName, file.buffer);
+      const table = tables
+        .filter((item) => item.records.length > 0)
+        .sort((left, right) => right.headers.length - left.headers.length || right.records.length - left.records.length)[0];
+      if (!table) {
+        return reply
+          .code(400)
+          .send({ ok: false, error: "文件里没有解析到数据行（仅支持 Excel / CSV，且需要有表头）" });
+      }
+      const sampled = Math.min(200, table.records.length);
+      const profile = {
+        dataset: {
+          id: "file",
+          name: file.fileName,
+          dataType: "tabular",
+          description: "本地文件",
+          recordCount: table.records.length,
+          targetTable: table.name,
+        },
+        total: table.records.length,
+        sampled,
+        fields: profileRecords(table.records.slice(0, sampled)),
+      };
+      const suggestion = await suggestMappingByProfile(token, networkId, profile);
+      const transformed = transformRecords(table.records.slice(0, 50), suggestion.mapping);
+      const fileNameLabel = `文件「${file.fileName}」`;
+      return {
+        ok: true,
+        fileName: file.fileName,
+        sheetName: table.name,
+        watermarkCandidates: watermarkCandidates(profile),
+        lastImport: findLastImport(networkId, fileNameLabel),
+        headers: table.headers,
+        rows: table.records.length,
+        sampleRows: table.records.slice(0, 20),
+        profile,
+        mapping: suggestion.mapping,
+        objectTypes: suggestion.objectTypes,
+        warnings: suggestion.warnings,
+        stats: transformed.stats,
+        documents: Object.fromEntries(
+          Object.entries(transformed.documents).map(([key, docs]) => [key, docs.slice(0, 10)]),
+        ),
+        issues: transformed.issues.slice(0, 50),
+      };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.post("/data/file/import", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    try {
+      const { file, fields } = await readMultipart(
+        request as unknown as { parts: () => AsyncIterable<unknown> },
+      );
+      const networkId = (fields.networkId ?? "").trim();
+      if (!file) return reply.code(400).send({ ok: false, error: "缺少上传文件" });
+      if (!networkId) return reply.code(400).send({ ok: false, error: "缺少 networkId" });
+      let mapping: ImportMapping | undefined;
+      if (fields.mapping) {
+        try {
+          mapping = JSON.parse(fields.mapping) as ImportMapping;
+        } catch {
+          return reply.code(400).send({ ok: false, error: "mapping 不是合法 JSON" });
+        }
+      }
+      if (!mapping || !Array.isArray(mapping.objects) || mapping.objects.length === 0) {
+        return reply.code(400).send({ ok: false, error: "缺少 mapping" });
+      }
+      const report = await importFileRecords(
+        token,
+        file.fileName,
+        file.buffer,
+        networkId,
+        mapping,
+        readImportOptions(fields),
+      );
+      return { ok: report.ok, report };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+
+  app.get("/data/connections", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    try {
+      return { ok: true, connections: await listDataConnections(token) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.get("/data/connections/:catalogId/tables", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const catalogId = String((request.params as { catalogId?: string }).catalogId ?? "").trim();
+    if (!catalogId) return reply.code(400).send({ ok: false, error: "缺少 catalogId" });
+    try {
+      return { ok: true, tables: await listConnectionTables(token, catalogId) };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.post("/data/connection/preview", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const body = (request.body ?? {}) as { networkId?: string; catalogId?: string; resourceId?: string; tableName?: string };
+    const networkId = String(body.networkId ?? "").trim();
+    const catalogId = String(body.catalogId ?? "").trim();
+    const resourceId = String(body.resourceId ?? "").trim();
+    const tableName = String(body.tableName ?? "").trim() || resourceId;
+    if (!networkId || !catalogId || !resourceId) {
+      return reply.code(400).send({ ok: false, error: "缺少 networkId / catalogId / resourceId" });
+    }
+    try {
+      const preview = await previewTable(token, networkId, catalogId, resourceId, tableName);
+      return {
+        ok: true,
+        ...preview,
+        watermarkCandidates: watermarkCandidates(preview.profile),
+        lastImport: findLastImport(networkId, `数据库表 ${tableName}`),
+      };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
+  app.post("/data/connection/import", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
+    const body = (request.body ?? {}) as {
+      networkId?: string;
+      catalogId?: string;
+      resourceId?: string;
+      tableName?: string;
+      mapping?: ImportMapping;
+      writeMode?: string;
+      watermarkField?: string;
+      watermarkValue?: string;
+    };
+    const networkId = String(body.networkId ?? "").trim();
+    const catalogId = String(body.catalogId ?? "").trim();
+    const resourceId = String(body.resourceId ?? "").trim();
+    const tableName = String(body.tableName ?? "").trim() || resourceId;
+    const mapping = body.mapping;
+    if (!networkId || !catalogId || !resourceId) {
+      return reply.code(400).send({ ok: false, error: "缺少 networkId / catalogId / resourceId" });
+    }
+    if (!mapping || !Array.isArray(mapping.objects) || mapping.objects.length === 0) {
+      return reply.code(400).send({ ok: false, error: "缺少 mapping" });
+    }
+    try {
+      const report = await importTableRecords(
+        token,
+        networkId,
+        catalogId,
+        resourceId,
+        tableName,
+        mapping,
+        readImportOptions(body),
+      );
+      return { ok: report.ok, report };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
   app.get("/settings", async () => settingsSummary());
 
   app.put("/settings", async (request, reply) => {
     const body = (request.body ?? {}) as SettingsBody;
+    const mode = body.mode === "platform" ? "platform" : "manual";
+
+    if (mode === "platform") {
+      const platformModel = (body.platformModel ?? "").trim();
+      if (!platformModel) {
+        reply.code(400);
+        return { ok: false, errors: ["请选择平台已配置的模型"] };
+      }
+      writeStoredSettings({
+        mode: "platform",
+        platformModel,
+        platformModelName: (body.platformModelName ?? "").trim() || platformModel,
+      });
+      return settingsSummary();
+    }
+
     const baseUrl = (body.baseUrl ?? "").trim();
     const model = (body.model ?? "").trim();
     const apiKeyInput = (body.apiKey ?? "").trim();
@@ -242,15 +726,14 @@ export async function copilotRoutes(app: FastifyInstance) {
       return { ok: false, errors: ["接口地址必须是 http(s) URL"] };
     }
 
-    const fallbackKey =
-      readStoredSettings()?.apiKey ?? readEnvSettings()?.apiKey ?? "";
+    const fallbackKey = readStoredSettings()?.apiKey ?? readEnvSettings()?.apiKey ?? "";
     const apiKey = apiKeyInput || fallbackKey;
     if (!apiKey) {
       reply.code(400);
       return { ok: false, errors: ["请填写 API Key"] };
     }
 
-    writeStoredSettings({ baseUrl, model, apiKey });
+    writeStoredSettings({ mode: "manual", baseUrl, model, apiKey });
     return settingsSummary();
   });
 
@@ -261,6 +744,28 @@ export async function copilotRoutes(app: FastifyInstance) {
 
   app.post("/settings/test", async (request, reply) => {
     const body = (request.body ?? {}) as SettingsBody;
+    const settings = readModelSettings();
+
+    if (settings?.mode === "platform" || body.mode === "platform") {
+      const token = readToken(request as unknown as { headers: Record<string, unknown> });
+      const platformModel = (body.platformModel ?? settings?.platformModel ?? "").trim();
+      if (!token) {
+        reply.code(401);
+        return { ok: false, error: "需要登录平台后才能测试平台模型" };
+      }
+      if (!platformModel) {
+        reply.code(400);
+        return { ok: false, error: "请先选择平台模型" };
+      }
+      const platformName = (body.platformModelName ?? settings?.platformModelName ?? platformModel).trim();
+      const platformResult = await testPlatformConnection(token, platformName, platformModel);
+      if (!platformResult.ok) {
+        reply.code(400);
+        return { ok: false, error: platformResult.error };
+      }
+      return { ok: true, latencyMs: platformResult.latencyMs };
+    }
+
     const result = await testLlmConnection({
       baseUrl: body.baseUrl?.trim(),
       model: body.model?.trim(),
@@ -295,9 +800,24 @@ export async function copilotRoutes(app: FastifyInstance) {
       reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
     };
 
-    if (!isLlmConfigured()) {
+    const modelSettings = readModelSettings();
+    const chatToken = readToken(request as unknown as { headers: Record<string, unknown> });
+    const platformMode = modelSettings?.mode === "platform" && Boolean(modelSettings.platformModel);
+
+    if (platformMode && !chatToken) {
+      const fallback = "平台模型模式需要登录平台后才能使用，请先登录再打开「智能构建」。";
+      for (const text of splitForStreaming(fallback)) {
+        writeEvent({ type: "delta", text });
+        await sleep(10);
+      }
+      writeEvent({ type: "done", warnings: [] });
+      reply.raw.end();
+      return;
+    }
+
+    if (!platformMode && !isLlmConfigured()) {
       const fallback =
-        "还没有配置模型连接。点抽屉右上角的设置按钮填写接口地址、模型名和 API Key 后，就可以和我对话修改草案了。";
+        "还没有配置模型连接。默认应使用平台「模型配置」里的模型；也可以在抽屉右上角的设置里手动填写接口地址、模型名和 API Key。";
       for (const text of splitForStreaming(fallback)) {
         writeEvent({ type: "delta", text });
         await sleep(10);
@@ -310,13 +830,24 @@ export async function copilotRoutes(app: FastifyInstance) {
     writeEvent({ type: "status", stage: "thinking", text: "正在阅读当前草案并理解你的要求…" });
 
     let firstToken = true;
-    const llmResult = await chatWithDraftStream(messages, draft, (text) => {
+    const onDelta = (text: string) => {
       if (firstToken) {
         firstToken = false;
         writeEvent({ type: "status", stage: "replying", text: "正在说明修改方案…" });
       }
       writeEvent({ type: "delta", text });
-    });
+    };
+    const llmResult =
+      platformMode && modelSettings?.platformModel
+        ? await chatWithDraftPlatformStream(
+            chatToken,
+            (modelSettings.platformModelName ?? modelSettings.platformModel).trim(),
+            modelSettings.platformModel,
+            messages,
+            draft,
+            onDelta,
+          )
+        : await chatWithDraftStream(messages, draft, onDelta);
 
     if (!llmResult.ok) {
       const fallback = `模型调用失败（${llmResult.error}），请检查「模型连接」设置后重试。`;
@@ -461,7 +992,28 @@ export async function copilotRoutes(app: FastifyInstance) {
     let raw: unknown = null;
     let llmError: string | undefined;
 
-    if (schemaMode && isLlmConfigured()) {
+    const analysisSettings = readModelSettings();
+    const analysisToken = readToken(request as unknown as { headers: Record<string, unknown> });
+    const platformAnalysis =
+      analysisSettings?.mode === "platform" &&
+      Boolean(analysisSettings.platformModel) &&
+      Boolean(analysisToken);
+    const manualAnalysis = analysisSettings?.mode === "manual" && isLlmConfigured();
+
+    if (platformAnalysis && analysisSettings?.platformModel) {
+      const result = await extractIrWithPlatform(
+        analysisToken,
+        (analysisSettings.platformModelName ?? analysisSettings.platformModel).trim(),
+        analysisSettings.platformModel,
+        sourceText,
+      );
+      if ("raw" in result) {
+        raw = result.raw;
+        mode = "llm";
+      } else {
+        llmError = result.error;
+      }
+    } else if (schemaMode && manualAnalysis) {
       const result = await extractIrFromSchema(sourceText);
       if ("raw" in result) {
         raw = result.raw;
@@ -469,7 +1021,7 @@ export async function copilotRoutes(app: FastifyInstance) {
       } else {
         llmError = result.error;
       }
-    } else if (isLlmConfigured() && !schemaMode) {
+    } else if (manualAnalysis && !schemaMode) {
       const result = await extractIrWithLlm(sourceText);
       if ("raw" in result) {
         raw = result.raw;

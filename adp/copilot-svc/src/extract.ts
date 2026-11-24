@@ -411,6 +411,62 @@ function buildHeaderInfo(matrix: unknown[][], merges: SheetMerge[] | undefined, 
   return { headers, columns, headerRowCount, health: headerHealth };
 }
 
+export type ExtractedRecords = {
+  name: string;
+  headers: string[];
+  rows: number;
+  records: Array<Record<string, unknown>>;
+  health?: ExtractHealth[];
+};
+
+/**
+ * 抽出表格类文件的全部数据行（用于「导入数据」按本体写入）。
+ * 只取第一张有数据的 sheet；非表格文件返回空数组。
+ */
+export async function extractRecords(
+  fileName: string,
+  buffer: Buffer,
+  maxRows = 20000,
+): Promise<ExtractedRecords[]> {
+  const extension = extname(fileName).toLowerCase();
+  if (!TABLE_EXTENSIONS.has(extension)) return [];
+
+  const { read, utils } = await import("xlsx");
+  const workbook = read(buffer, { type: "buffer" });
+  const result: ExtractedRecords[] = [];
+
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    const matrix = utils.sheet_to_json<unknown[]>(sheet, { header: 1, blankrows: false, defval: "" });
+    if (matrix.length === 0) continue;
+    const merged = (sheet as unknown as { "!merges"?: SheetMerge[] })["!merges"];
+    const info = buildHeaderInfo(matrix, merged, sheetName);
+    if (info.headers.length === 0) continue;
+
+    const records: Array<Record<string, unknown>> = [];
+    for (let index = info.headerRowCount; index < matrix.length && records.length < maxRows; index += 1) {
+      const row = matrix[index] ?? [];
+      if (row.every((cell) => cellText(cell) === "")) continue;
+      const record: Record<string, unknown> = {};
+      info.headers.forEach((header, position) => {
+        const cell = row[info.columns[position] ?? position];
+        record[header] = cell === undefined || cell === null ? "" : cell;
+      });
+      records.push(record);
+    }
+    if (records.length === 0) continue;
+    result.push({
+      name: sheetName,
+      headers: info.headers,
+      rows: records.length,
+      records,
+      ...(info.health.length > 0 ? { health: info.health } : {}),
+    });
+  }
+
+  return result;
+}
+
 /**
  * 抽出表格类文件的表结构，供数据绑定推断使用。
  * 非表格文件返回空数组。

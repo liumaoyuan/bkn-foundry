@@ -1,8 +1,11 @@
 /**
- * 大模型调用：OpenAI 兼容 /chat/completions。
+ * 大模型调用：支持两种模式——
+ * 1) manual：自带 OpenAI 兼容接口（/chat/completions）；
+ * 2) platform：转发到「九格多源本体构建系统 → 模型管理」里已配置的模型（需用户 token）。
  * 配置来源见 settings.ts（本地文件 > 环境变量）。
  */
-import { resolveSettings } from "./settings.js";
+import { resolveSettings, type ModelSettings } from "./settings.js";
+import { chatViaPlatform } from "./platform-model.js";
 
 export type LlmConfig = {
   baseUrl: string;
@@ -10,13 +13,31 @@ export type LlmConfig = {
   model: string;
 };
 
+/** 当前生效的模型设置（manual 或 platform）。 */
+export function readModelSettings(): ModelSettings | null {
+  return resolveSettings().settings;
+}
+
+/** 仅 manual 模式返回 OpenAI 兼容配置。 */
 export function readLlmConfig(): LlmConfig | null {
-  const { settings } = resolveSettings();
-  return settings;
+  const settings = readModelSettings();
+  if (!settings || settings.mode !== "manual" || !settings.baseUrl || !settings.model) {
+    return null;
+  }
+  return { baseUrl: settings.baseUrl, apiKey: settings.apiKey ?? "", model: settings.model };
+}
+
+/** 平台模式返回平台模型 id。 */
+export function readPlatformModelId(): string | null {
+  const settings = readModelSettings();
+  if (!settings || settings.mode !== "platform" || !settings.platformModel) {
+    return null;
+  }
+  return settings.platformModel;
 }
 
 export function isLlmConfigured(): boolean {
-  return readLlmConfig() !== null;
+  return readModelSettings() !== null;
 }
 
 const EXTRACT_SYSTEM_PROMPT = `你是本体建模助手。根据用户提供的业务文档，抽取知识网络本体。
@@ -480,4 +501,119 @@ export async function testLlmConnection(
     return { ok: false, error: result.error };
   }
   return { ok: true, latencyMs: Date.now() - startedAt };
+}
+
+/** 平台模式：抽取 IR（非流式）。 */
+export async function extractIrWithPlatform(
+  token: string,
+  model: string,
+  modelId: string | undefined,
+  text: string,
+): Promise<{ raw: unknown } | { error: string }> {
+  try {
+    const content = await chatViaPlatform(token, model, [
+      { role: "system", content: EXTRACT_SYSTEM_PROMPT },
+      { role: "user", content: text.slice(0, 60_000) },
+    ]);
+    const parsed = extractJsonObject(content);
+    if (!parsed) {
+      return { error: "LLM 未返回 JSON" };
+    }
+    return { raw: parsed };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "平台模型调用失败" };
+  }
+}
+
+/** 平台模式：流式对话修改草案（与 manual 模式同样的 @@CHANGES@@ 协议）。 */
+export async function chatWithDraftPlatformStream(
+  token: string,
+  model: string,
+  modelId: string | undefined,
+  messages: { role: string; content: string }[],
+  draft: unknown,
+  onDelta: (text: string) => void,
+): Promise<{ ok: true; reply: string; ops?: unknown; ir?: unknown } | { ok: false; error: string }> {
+  const history = messages
+    .slice(-8)
+    .map((item) => ({
+      role: item.role === "assistant" ? "assistant" : "user",
+      content: String(item.content ?? "").slice(0, 4_000),
+    }));
+  const draftText = draft ? JSON.stringify(draft).slice(0, 60_000) : "（暂无草案）";
+
+  let pending = "";
+  let replyText = "";
+  let opsBuffer = "";
+  let markerSeen = false;
+  const emit = (text: string) => {
+    if (!text) {
+      return;
+    }
+    replyText += text;
+    onDelta(text);
+  };
+
+  try {
+    await chatViaPlatform(
+      token,
+      model,
+      [
+        { role: "system" as const, content: `${CHAT_SYSTEM_PROMPT}\n\n当前草案：\n${draftText}` },
+        ...history.map((item) => ({ role: item.role as "user" | "assistant", content: item.content })),
+      ],
+      {
+        stream: true,
+        onDelta: (chunk) => {
+          if (markerSeen) {
+            opsBuffer += chunk;
+            return;
+          }
+          pending += chunk;
+          const index = pending.indexOf(OPS_MARKER);
+          if (index >= 0) {
+            emit(pending.slice(0, index).trimEnd());
+            opsBuffer = pending.slice(index + OPS_MARKER.length);
+            pending = "";
+            markerSeen = true;
+            return;
+          }
+          const safeLength = Math.max(0, pending.length - OPS_MARKER.length);
+          emit(pending.slice(0, safeLength));
+          pending = pending.slice(safeLength);
+        },
+      },
+    );
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "平台模型调用失败" };
+  }
+
+  if (!markerSeen) {
+    emit(pending);
+    const parsed = extractJsonObject(replyText) as ChatParseResult | null;
+    if (parsed && Array.isArray(parsed.ops)) {
+      return { ok: true, reply: "", ops: parsed.ops, ir: parsed.ir };
+    }
+    return { ok: true, reply: replyText.trim() };
+  }
+
+  const parsed = extractJsonObject(opsBuffer) as { ops?: unknown; ir?: unknown } | null;
+  return { ok: true, reply: replyText.trim(), ops: parsed?.ops, ir: parsed?.ir };
+}
+
+/** 平台模式：测试连通性（发一条最小请求）。 */
+export async function testPlatformConnection(
+  token: string,
+  model: string,
+  modelId: string | undefined,
+): Promise<{ ok: true; latencyMs: number } | { ok: false; error: string }> {
+  const startedAt = Date.now();
+  try {
+    await chatViaPlatform(token, model, [{ role: "user", content: "ping" }], {
+      timeoutMs: 30_000,
+    });
+    return { ok: true, latencyMs: Date.now() - startedAt };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "平台模型调用失败" };
+  }
 }
