@@ -13,7 +13,18 @@ from typing import Any
 from urllib.parse import quote_plus, urljoin
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect as sqlalchemy_inspect, text
+from sqlalchemy.engine import Engine
+
+
+_DATE_TYPE_MARKERS = ("DATE", "TIME")
+_INTEGER_TYPE_MARKERS = ("INT", "NUMBER", "NUMERIC", "DECIMAL")
+_WATERMARK_NAME_GROUPS = (
+    ("updated_at", "update_time", "last_updated", "last_modified", "modified_at", "changed_at"),
+    ("created_at", "create_time", "created_time"),
+    ("version",),
+    ("id",),
+)
 
 
 def load_sftp_private_key(value: str):
@@ -48,6 +59,172 @@ def database_url(source_type: str, config: dict[str, Any]) -> str:
         database = quote_plus(str(config.get("database") or ""))
         return f"postgresql+psycopg://{username}:{password}@{host}:{port}/{database}"
     raise ValueError("数据源不是受支持的数据库类型")
+
+
+def database_query_mode(config: dict[str, Any]) -> str:
+    return "table" if str(config.get("query_mode") or "").strip() == "table" else "custom"
+
+
+def _column_type_name(column: dict[str, Any]) -> str:
+    return str(column.get("type") or "").upper()
+
+
+def _recommend_watermark(columns: list[dict[str, Any]]) -> dict[str, str]:
+    by_name = {str(column["name"]).lower(): column for column in columns}
+    for group_index, names in enumerate(_WATERMARK_NAME_GROUPS):
+        for name in names:
+            column = by_name.get(name)
+            if column is None:
+                continue
+            type_name = _column_type_name(column)
+            is_temporal = any(marker in type_name for marker in _DATE_TYPE_MARKERS)
+            is_integer = any(marker in type_name for marker in _INTEGER_TYPE_MARKERS)
+            if group_index < 3 and not (is_temporal or is_integer):
+                continue
+            if group_index == 3 and not is_integer:
+                continue
+            reasons = {
+                0: "这是更新时间字段，适合同步新增和修改的数据。",
+                1: "这是创建时间字段，适合只追加、不修改的数据。",
+                2: "这是版本字段，适合版本号持续递增的数据。",
+                3: "这是数字主键，适合只追加、不修改的数据。",
+            }
+            return {
+                "watermark_column": str(column["name"]),
+                "sync_mode": "incremental",
+                "initial_cursor": "0" if is_integer else "1970-01-01T00:00:00",
+                "reason": reasons[group_index],
+            }
+    return {
+        "watermark_column": "",
+        "sync_mode": "full",
+        "initial_cursor": "",
+        "reason": "没有找到可靠的更新字段，将先使用全量检查。",
+    }
+
+
+def _database_catalog_data(
+    engine: Engine,
+    config: dict[str, Any],
+    *,
+    table_name: str = "",
+) -> dict[str, Any]:
+    inspector = sqlalchemy_inspect(engine)
+    schema_name = str(config.get("schema_name") or "").strip() or None
+    tables = {
+        name: "table" for name in inspector.get_table_names(schema=schema_name)
+    }
+    for name in inspector.get_view_names(schema=schema_name):
+        tables.setdefault(name, "view")
+    table_options = [
+        {"name": name, "kind": kind}
+        for name, kind in sorted(tables.items(), key=lambda item: item[0].lower())
+    ]
+    resolved_schema = schema_name or inspector.default_schema_name or ""
+    if not table_name:
+        return {
+            "schema_name": resolved_schema,
+            "tables": table_options,
+            "table_name": "",
+            "columns": [],
+            "primary_keys": [],
+            "recommended_watermark": "",
+            "recommended_sync_mode": "full",
+            "recommended_initial_cursor": "",
+            "recommendation_reason": "",
+            "generated_query": "",
+        }
+    if table_name not in tables:
+        raise ValueError(f"数据库中不存在表或视图：{table_name}")
+
+    primary_keys = list(
+        (inspector.get_pk_constraint(table_name, schema=schema_name) or {}).get(
+            "constrained_columns",
+            [],
+        )
+    )
+    raw_columns = inspector.get_columns(table_name, schema=schema_name)
+    columns = [
+        {
+            "name": str(column["name"]),
+            "type": str(column.get("type") or ""),
+            "nullable": bool(column.get("nullable", True)),
+            "primary_key": str(column["name"]) in primary_keys,
+        }
+        for column in raw_columns
+    ]
+    recommendation = _recommend_watermark(columns)
+    generated_config = {
+        **config,
+        "query_mode": "table",
+        "table_name": table_name,
+        "sync_mode": recommendation["sync_mode"],
+        "watermark_column": recommendation["watermark_column"],
+    }
+    return {
+        "schema_name": resolved_schema,
+        "tables": table_options,
+        "table_name": table_name,
+        "columns": columns,
+        "primary_keys": primary_keys,
+        "recommended_watermark": recommendation["watermark_column"],
+        "recommended_sync_mode": recommendation["sync_mode"],
+        "recommended_initial_cursor": recommendation["initial_cursor"],
+        "recommendation_reason": recommendation["reason"],
+        "generated_query": database_source_query(engine, generated_config),
+    }
+
+
+def inspect_database_catalog(
+    source_type: str,
+    config: dict[str, Any],
+    *,
+    table_name: str = "",
+) -> dict[str, Any]:
+    engine = create_engine(database_url(source_type, config), pool_pre_ping=True)
+    try:
+        return _database_catalog_data(engine, config, table_name=table_name)
+    finally:
+        engine.dispose()
+
+
+def database_source_query(engine: Engine, config: dict[str, Any]) -> str:
+    if database_query_mode(config) != "table":
+        return str(config.get("query") or "").strip()
+
+    table_name = str(config.get("table_name") or "").strip()
+    if not table_name:
+        raise ValueError("请选择要同步的数据库表")
+    inspector = sqlalchemy_inspect(engine)
+    schema_name = str(config.get("schema_name") or "").strip() or None
+    table_names = set(inspector.get_table_names(schema=schema_name))
+    table_names.update(inspector.get_view_names(schema=schema_name))
+    if table_name not in table_names:
+        raise ValueError(f"数据库中不存在表或视图：{table_name}")
+    columns = {
+        str(column["name"])
+        for column in inspector.get_columns(table_name, schema=schema_name)
+    }
+    quote = engine.dialect.identifier_preparer.quote
+    qualified_table = (
+        f"{quote(schema_name)}.{quote(table_name)}"
+        if schema_name
+        else quote(table_name)
+    )
+    query = f"SELECT * FROM {qualified_table}"
+    sync_mode = str(config.get("sync_mode") or "full")
+    if sync_mode != "incremental":
+        return query
+    watermark_column = str(config.get("watermark_column") or "").strip()
+    if not watermark_column:
+        raise ValueError("增量同步需要选择判断数据变化的字段")
+    if watermark_column not in columns:
+        raise ValueError(f"表中不存在字段：{watermark_column}")
+    quoted_watermark = quote(watermark_column)
+    return (
+        f"{query} WHERE {quoted_watermark} >= :cursor "
+        f"ORDER BY {quoted_watermark} ASC"
+    )
 
 
 def _path_value(value: Any, path: str) -> Any:
@@ -261,13 +438,13 @@ def _test_database(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     engine = create_engine(database_url(source_type, config), pool_pre_ping=True)
-    query = str(config.get("query") or "").strip()
+    query = database_source_query(engine, config)
     try:
         with engine.connect() as connection:
             if query:
                 params = {}
                 if ":cursor" in query:
-                    params["cursor"] = "1970-01-01T00:00:00"
+                    params["cursor"] = str(config.get("initial_cursor") or "1970-01-01T00:00:00")
                 result = connection.execute(text(query), params)
                 row = result.fetchone()
                 return {"connected": True, "sample_available": row is not None}

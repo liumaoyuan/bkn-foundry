@@ -22,13 +22,16 @@ description: 通过 MCP 预览并导入 CSV、Excel、PDF、DOCX、图片或视�
 ## 标准流程
 
 1. 不确定平台或存储状态时，调用 `api_health` 和 `storage_info`。
-2. 用户未提供准确 ID 时，调用 `list_datasets` 和 `list_pipeline_templates`。
-3. 每次文件入库前调用 `inspect_local_file`，报告文件类型、Sheet、样例、警告和推荐管线。
-4. 只能使用已存在的数据集，除非用户明确要求创建数据集。
-5. 默认使用 `template_code="auto"`，用户指定管线时使用指定代码。
-6. 文件调用 `ingest_local_file`，小型 Agent 生成内容调用 `ingest_text`。
-7. 核验任务状态、插入数、重复数、错误数和每个阶段结果。
-8. 周期性导入必须由用户明确提供周期、时间或 Cron 与目标数据集。
+2. 用户未明确目标数据集时，先调用 `list_datasets`，列出可选数据集并等待用户选择；
+   不得自行猜测或选择默认数据集。
+3. 用户消息中的“[用户上传附件]”表示附件已保存在允许目录内。先把其中的
+   `file_path` 当作待入库文件，不得要求用户再次提供本机路径。
+4. 每次文件入库前调用 `inspect_local_file`，报告文件类型、Sheet、样例、警告和推荐管线。
+5. 只能使用已存在的数据集，除非用户明确要求创建数据集。
+6. 默认使用 `template_code="auto"`，用户指定管线时使用指定代码。
+7. 文件调用 `ingest_local_file`，小型 Agent 生成内容调用 `ingest_text`。
+8. 核验任务状态、插入数、重复数、错误数和每个阶段结果。
+9. 周期性导入必须由用户明确提供周期、时间或 Cron 与目标数据集。
 
 ## 自定义能力
 

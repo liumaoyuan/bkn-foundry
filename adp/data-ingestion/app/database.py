@@ -221,6 +221,7 @@ def init_database() -> None:
     Base.metadata.create_all(bind=configured_engine)
     _ensure_auto_scan_columns(configured_engine)
     _ensure_agent_session_columns(configured_engine)
+    _ensure_agent_message_columns(configured_engine)
     _ensure_dataset_storage_columns(configured_engine)
     _ensure_ingestion_columns(configured_engine)
     _ensure_default_space()
@@ -332,6 +333,7 @@ def initialize_space_database(space: DataSpace) -> Engine:
     Base.metadata.create_all(bind=configured_engine)
     _ensure_auto_scan_columns(configured_engine)
     _ensure_agent_session_columns(configured_engine)
+    _ensure_agent_message_columns(configured_engine)
     _ensure_dataset_storage_columns(configured_engine)
     _ensure_ingestion_columns(configured_engine)
     if space.id != DEFAULT_SPACE_ID:
@@ -496,6 +498,26 @@ def _ensure_agent_session_columns(target_engine: Engine) -> None:
         )
 
 
+def _ensure_agent_message_columns(target_engine: Engine) -> None:
+    inspector = inspect(target_engine)
+    if "agent_messages" not in inspector.get_table_names():
+        return
+    existing = {
+        column["name"]
+        for column in inspector.get_columns("agent_messages")
+    }
+    if "attachments" in existing:
+        return
+    json_type = "JSON" if target_engine.dialect.name != "sqlite" else "TEXT"
+    with target_engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE agent_messages "
+                f"ADD COLUMN attachments {json_type} NULL"
+            )
+        )
+
+
 def _ensure_dataset_storage_columns(target_engine: Engine) -> None:
     inspector = inspect(target_engine)
     if "datasets" not in inspector.get_table_names():
@@ -523,12 +545,20 @@ def _ensure_dataset_storage_columns(target_engine: Engine) -> None:
 def _ensure_ingestion_columns(target_engine: Engine) -> None:
     inspector = inspect(target_engine)
     tables = set(inspector.get_table_names())
+    json_type = "JSON" if target_engine.dialect.name != "sqlite" else "TEXT"
     additions = {
         "ingestion_runs": {
             "updated_count": "INTEGER NOT NULL DEFAULT 0",
+            "source_object": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "source_context": f"{json_type} NULL",
+            "incremental_cursor_before": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "incremental_cursor_after": "VARCHAR(255) NOT NULL DEFAULT ''",
         },
         "dataset_records": {
             "record_key": "VARCHAR(96) NOT NULL DEFAULT ''",
+            "source_id": "VARCHAR(32) NULL",
+            "source_object": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "source_locator": f"{json_type} NULL",
         },
     }
     with target_engine.begin() as connection:

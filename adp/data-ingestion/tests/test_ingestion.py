@@ -90,6 +90,14 @@ class IngestionServiceTest(unittest.TestCase):
                 )
             )
             self.assertEqual(total, first_inserted)
+            stored_record = db.scalar(
+                select(DatasetRecord).where(DatasetRecord.dataset_id == dataset.id)
+            )
+            self.assertIsNotNone(stored_record)
+            self.assertTrue(stored_record.source_object)
+            self.assertEqual(stored_record.source_locator["kind"], "file")
+            self.assertTrue(stored_record.source_locator["source_uri"])
+            self.assertEqual(len(stored_record.stable_record_id), 32)
         finally:
             db.close()
 

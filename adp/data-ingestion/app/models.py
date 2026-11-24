@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -106,6 +107,57 @@ class Dataset(Base):
     records: Mapped[list[DatasetRecord]] = relationship(
         back_populates="dataset",
         cascade="all, delete-orphan",
+    )
+
+
+class DatasetPublication(Base):
+    __tablename__ = "dataset_publications"
+
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("datasets.id"),
+        primary_key=True,
+    )
+    catalog_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    resource_id: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default="not_published",
+        index=True,
+    )
+    discovery_started: Mapped[bool] = mapped_column(default=False)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    last_published_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
+class DataQualityCheck(Base):
+    __tablename__ = "data_quality_checks"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("datasets.id"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default="queued",
+        index=True,
+    )
+    scope: Mapped[str] = mapped_column(String(24), default="full")
+    total_records: Mapped[int] = mapped_column(Integer, default=0)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=utc_now,
+        index=True,
     )
 
 
@@ -262,6 +314,8 @@ class IngestionRun(Base):
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
     file_type: Mapped[str] = mapped_column(String(32), default="unknown")
     media_type: Mapped[str] = mapped_column(String(120), default="")
+    source_object: Mapped[str] = mapped_column(String(255), default="")
+    source_context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     file_size: Mapped[int] = mapped_column(BigInteger, default=0)
     fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
     source_path: Mapped[str] = mapped_column(Text, default="")
@@ -271,6 +325,8 @@ class IngestionRun(Base):
     updated_count: Mapped[int] = mapped_column(Integer, default=0)
     duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
+    incremental_cursor_before: Mapped[str] = mapped_column(String(255), default="")
+    incremental_cursor_after: Mapped[str] = mapped_column(String(255), default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
@@ -346,12 +402,22 @@ class DatasetRecord(Base):
     data_type: Mapped[str] = mapped_column(String(32), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     asset_path: Mapped[str] = mapped_column(Text, default="")
+    source_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    source_object: Mapped[str] = mapped_column(String(255), default="")
+    source_locator: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(),
         default=utc_now,
     )
 
     dataset: Mapped[Dataset] = relationship(back_populates="records")
+
+    @property
+    def stable_record_id(self) -> str:
+        identity = self.record_key or self.fingerprint
+        return hashlib.sha256(
+            f"{self.dataset_id}:{identity}".encode("utf-8")
+        ).hexdigest()[:32]
 
 
 class DataAsset(Base):
@@ -427,6 +493,7 @@ class AgentMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(24), nullable=False)
     content: Mapped[str] = mapped_column(Text, default="")
+    attachments: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     tool_calls: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     tool_call_id: Mapped[str] = mapped_column(String(160), default="")
     name: Mapped[str] = mapped_column(String(160), default="")

@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 
 from .config import DATA_DIR
 from .database import DEFAULT_SPACE_ID, session_for_space
+from .document_extraction import extract_document_content
 from .file_inspector import (
     decode_text,
     inspect_file,
@@ -65,6 +66,46 @@ def payload_fingerprint(data_type: str, payload: dict[str, Any]) -> str:
         default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def record_source_locator(
+    run: IngestionRun,
+    dataset: Dataset | None,
+    payload: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    context = run.source_context or {}
+    source_object = run.source_object or run.original_name
+    if str(context.get("kind") or "") == "database":
+        primary_key_fields = list(
+            context.get("primary_key_fields")
+            or (dataset.upsert_keys if dataset is not None else [])
+            or []
+        )
+        primary_key = {
+            field: payload[field]
+            for field in primary_key_fields
+            if field in payload and payload[field] not in (None, "")
+        }
+        return {
+            "kind": "database",
+            "table": source_object,
+            "primary_key": primary_key,
+            "row_number": index + 1,
+        }
+    if run.source_path:
+        locator = {
+            "kind": "file",
+            "file": run.original_name,
+            "row_number": index + 1,
+            "source_uri": run.source_path,
+        }
+        if payload.get("__sheet_name") is not None:
+            locator["sheet_name"] = payload["__sheet_name"]
+        if payload.get("__sheet_index") is not None:
+            locator["sheet_index"] = payload["__sheet_index"]
+        return locator
+    return {"kind": "record", "row_number": index + 1}
 
 
 def _bounded_json(value: Any, limit: int = 12000) -> str:
@@ -185,38 +226,9 @@ def extract_rows(
         workbook.close()
         return rows, metadata, ""
 
-    if file_type == "pdf":
-        from pypdf import PdfReader
-
-        reader = PdfReader(io.BytesIO(content))
-        text = "\n".join((page.extract_text() or "") for page in reader.pages)
-        return (
-            [],
-            {
-                "page_count": len(reader.pages),
-                "character_count": len(text),
-            },
-            text,
-        )
-
-    if file_type == "document":
-        from docx import Document
-
-        document = Document(io.BytesIO(content))
-        text = "\n".join(
-            paragraph.text.strip()
-            for paragraph in document.paragraphs
-            if paragraph.text.strip()
-        )
-        return (
-            [],
-            {
-                "paragraph_count": len(document.paragraphs),
-                "table_count": len(document.tables),
-                "character_count": len(text),
-            },
-            text,
-        )
+    if file_type in {"pdf", "document"}:
+        extracted = extract_document_content(file_type, content)
+        return [], extracted.metadata, extracted.text
 
     if file_type == "image":
         from PIL import Image
@@ -553,6 +565,16 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
             run.artifact_path = artifact_path
             db.commit()
         if active_stage:
+            extracted_table_count = int(metadata.get("table_count") or 0)
+            extraction_logs = [f"识别到 {extracted_count} 条可入库单元。"]
+            if file_type in {"pdf", "document"}:
+                extraction_logs.append(
+                    f"已提取 {extracted_table_count} 个表格并转换为 Markdown。"
+                    if extracted_table_count
+                    else "未检测到可识别的表格，已保留文档正文。"
+                )
+            if extracted_text:
+                extraction_logs.append("正文和表格已写入中间产物。")
             set_stage(
                 db,
                 active_stage,
@@ -564,10 +586,7 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                     "preview": rows[:5] if rows else extracted_text[:800],
                     "artifact_path": artifact_path,
                 },
-                logs=[
-                    f"识别到 {extracted_count} 条可入库单元。",
-                    *(["正文已写入中间产物。"] if extracted_text else []),
-                ],
+                logs=extraction_logs,
             )
 
         active_stage = stages.get("normalize")
@@ -699,6 +718,14 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                         if item["data_type"] in {"document", "image", "video"}
                         else ""
                     ),
+                    "source_id": run.source_id,
+                    "source_object": run.source_object or run.original_name,
+                    "source_locator": record_source_locator(
+                        run,
+                        dataset,
+                        item["payload"],
+                        index,
+                    ),
                     "row_index": index,
                     "payload": item["payload"],
                     "created_at": now,
@@ -734,8 +761,16 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                             if item["data_type"] in {"document", "image", "video"}
                             else ""
                         ),
+                        "source_id": run.source_id,
+                        "source_object": run.source_object or run.original_name,
+                        "source_locator": record_source_locator(
+                            run,
+                            dataset,
+                            item["payload"],
+                            index,
+                        ),
                     }
-                    for item in payloads
+                    for index, item in enumerate(payloads)
                 ],
             )
         asset_exists = db.scalar(

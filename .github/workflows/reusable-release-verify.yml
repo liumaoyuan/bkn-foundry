@@ -79,7 +79,7 @@ jobs:
               pip install -r test-requirements.txt
             fi
           fi
-          pytest
+          python -m pytest
 
       - name: Setup Helm
         if: ${{ inputs.stack == 'chart-only' }}

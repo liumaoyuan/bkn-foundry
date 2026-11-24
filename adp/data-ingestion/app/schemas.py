@@ -65,6 +65,13 @@ class DataSourceUpdate(BaseModel):
     config: dict[str, Any] | None = None
 
 
+class DatabaseCatalogRequest(BaseModel):
+    source_id: str | None = None
+    source_type: str = "mysql"
+    config: dict[str, Any] = Field(default_factory=dict)
+    table_name: str = ""
+
+
 class DataSourceOut(ORMModel):
     id: str
     name: str
@@ -218,6 +225,8 @@ class RunOut(ORMModel):
     original_name: str
     file_type: str
     media_type: str
+    source_object: str
+    source_context: dict[str, Any] | None
     file_size: int
     fingerprint: str
     fetched_count: int
@@ -225,6 +234,8 @@ class RunOut(ORMModel):
     updated_count: int
     duplicate_count: int
     error_count: int
+    incremental_cursor_before: str
+    incremental_cursor_after: str
     error_message: str
     started_at: datetime | None
     finished_at: datetime | None
@@ -240,12 +251,15 @@ class RunListItem(ORMModel):
     status: str
     original_name: str
     file_type: str
+    source_object: str
     file_size: int
     fetched_count: int
     inserted_count: int
     updated_count: int
     duplicate_count: int
     error_count: int
+    incremental_cursor_before: str
+    incremental_cursor_after: str
     error_message: str
     started_at: datetime | None
     finished_at: datetime | None
@@ -260,6 +274,10 @@ class DatasetRecordOut(ORMModel):
     data_type: str
     payload: dict[str, Any]
     asset_path: str
+    source_id: str | None
+    source_object: str
+    source_locator: dict[str, Any] | None
+    stable_record_id: str
     created_at: datetime
 
 
@@ -267,12 +285,18 @@ class DatasetFieldSchema(BaseModel):
     name: str
     data_type: str
     nullable: bool
+    present_count: int
+    completeness: float
+    sample_values: list[Any]
+    primary_key: bool
 
 
 class DatasetSchemaOut(BaseModel):
     schema_version: str
     sampled_records: int
     total_records: int
+    primary_key_fields: list[str]
+    stable_key_strategy: str
     fields: list[DatasetFieldSchema]
 
 
@@ -315,6 +339,7 @@ class AgentMessageOut(ORMModel):
     id: str
     role: str
     content: str
+    attachments: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
     tool_call_id: str
     name: str

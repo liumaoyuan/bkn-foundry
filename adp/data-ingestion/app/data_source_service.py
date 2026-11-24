@@ -10,6 +10,22 @@ from .secret_store import decrypt_secret, encrypt_secret
 SECRET_KEYS = {"password", "api_key", "secret", "private_key"}
 
 
+def validate_source_config(source_type: str, config: dict[str, Any]) -> None:
+    if source_type not in {"mysql", "postgres", "postgresql"}:
+        return
+    if str(config.get("query_mode") or "") != "table":
+        return
+    if not str(config.get("table_name") or "").strip():
+        raise ValueError("请选择需要同步的数据表")
+    sync_mode = str(config.get("sync_mode") or "full")
+    if sync_mode not in {"full", "incremental"}:
+        raise ValueError("同步方式只能是全量检查或增量同步")
+    if sync_mode == "incremental" and not str(
+        config.get("watermark_column") or ""
+    ).strip():
+        raise ValueError("增量同步需要选择判断数据变化的字段")
+
+
 def prepare_source_config(config: dict[str, Any]) -> dict[str, Any]:
     prepared = {
         key: value

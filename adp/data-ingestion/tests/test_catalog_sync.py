@@ -34,13 +34,18 @@ class CatalogSyncTest(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(
                     200,
                     json={
-                        "id": "catalog-bkn",
-                        "connector_type": "mysql",
-                        "connector_config": {
-                            "database": "bkn",
-                            "host": "db.example.com",
-                            "port": 3306,
-                        },
+                        "entries": [
+                            {
+                                "id": "catalog-bkn",
+                                "name": "bkn",
+                                "connector_type": "mysql",
+                                "connector_config": {
+                                    "database": "bkn",
+                                    "host": "db.example.com",
+                                    "port": 3306,
+                                },
+                            }
+                        ]
                     },
                 )
             if request.url.path.endswith("/discover"):
@@ -113,6 +118,192 @@ class CatalogSyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created_body["connector_type"], "mariadb")
         self.assertEqual(created_body["name"], "customer_db")
         self.assertEqual(created_body["connector_config"]["port"], 3307)
+
+    async def test_reuses_same_named_catalog_when_detail_omits_config(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path.endswith("/catalogs") and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {"id": "catalog-bkn", "name": "bkn", "connector_type": "mysql"}
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/catalogs/catalog-bkn"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {
+                                "id": "catalog-bkn",
+                                "name": "bkn",
+                                "connector_type": "mysql",
+                                "connector_config": {},
+                            }
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/discover"):
+                return httpx.Response(200, json={"id": "discover-1"})
+            return httpx.Response(404)
+
+        space = DataSpace(
+            id="space-1",
+            name="Default",
+            slug="default",
+            database_url_encrypted=encrypt_secret(
+                "mysql+pymysql://reader:secret@db.example.com:3306/bkn"
+            ),
+            database_label="mysql://db.example.com:3306/bkn",
+            is_default=True,
+            status="ready",
+        )
+        result = await sync_space_catalog(
+            space,
+            access_token="access-token",
+            gateway_url="http://gateway.test",
+            transport=httpx.MockTransport(handler),
+        )
+
+        self.assertEqual(result["catalog_id"], "catalog-bkn")
+        self.assertFalse(result["created"])
+        self.assertFalse(
+            any(
+                request.url.path.endswith("/catalogs") and request.method == "POST"
+                for request in requests
+            )
+        )
+
+    async def test_recovers_existing_catalog_after_duplicate_name_error(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path.endswith("/catalogs") and request.method == "GET":
+                if request.url.params.get("name") == "bkn":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "entries": [
+                                {"id": "catalog-bkn", "name": "bkn", "connector_type": "mysql"}
+                            ]
+                        },
+                    )
+                return httpx.Response(200, json={"entries": []})
+            if request.url.path.endswith("/catalogs") and request.method == "POST":
+                return httpx.Response(409, json={"description": "目录名称已存在"})
+            if request.url.path.endswith("/catalogs/catalog-bkn"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {
+                                "id": "catalog-bkn",
+                                "name": "bkn",
+                                "connector_type": "mysql",
+                                "connector_config": {
+                                    "database": "bkn",
+                                    "host": "db.example.com",
+                                    "port": 3306,
+                                },
+                            }
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/discover"):
+                return httpx.Response(200, json={"id": "discover-1"})
+            return httpx.Response(404)
+
+        space = DataSpace(
+            id="space-1",
+            name="Default",
+            slug="default",
+            database_url_encrypted=encrypt_secret(
+                "mysql+pymysql://reader:secret@db.example.com:3306/bkn"
+            ),
+            database_label="mysql://db.example.com:3306/bkn",
+            is_default=True,
+            status="ready",
+        )
+        result = await sync_space_catalog(
+            space,
+            access_token="access-token",
+            gateway_url="http://gateway.test",
+            transport=httpx.MockTransport(handler),
+        )
+
+        self.assertEqual(result["catalog_id"], "catalog-bkn")
+        self.assertFalse(result["created"])
+        self.assertTrue(result["discovery_started"])
+
+    async def test_resolves_published_resource_id_after_discovery(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/catalogs") and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {"id": "catalog-bkn", "connector_type": "mysql"}
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/catalogs/catalog-bkn"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {
+                                "id": "catalog-bkn",
+                                "name": "bkn",
+                                "connector_type": "mysql",
+                                "connector_config": {
+                                    "database": "bkn",
+                                    "host": "db.example.com",
+                                    "port": 3306,
+                                },
+                            }
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/discover"):
+                return httpx.Response(200, json={"id": "discover-1"})
+            if request.url.path.endswith("/resources"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {
+                                "id": "resource-1",
+                                "name": "di_records_dataset123",
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(404)
+
+        space = DataSpace(
+            id="space-1",
+            name="Default",
+            slug="default",
+            database_url_encrypted=encrypt_secret(
+                "mysql+pymysql://reader:secret@db.example.com:3306/bkn"
+            ),
+            database_label="mysql://db.example.com:3306/bkn",
+            is_default=True,
+            status="ready",
+        )
+        result = await sync_space_catalog(
+            space,
+            access_token="access-token",
+            gateway_url="http://gateway.test",
+            transport=httpx.MockTransport(handler),
+            resource_name="di_records_dataset123",
+        )
+        self.assertEqual(result["resource_id"], "resource-1")
 
 
 if __name__ == "__main__":
