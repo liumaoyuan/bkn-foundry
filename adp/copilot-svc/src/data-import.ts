@@ -74,7 +74,15 @@ export type TransformIssue = { row: number; field?: string; message: string };
 export type TransformResult = {
   documents: Record<string, Array<Record<string, unknown>>>;
   issues: TransformIssue[];
-  stats: { rows: number; documents: number; skipped: number; issueCount: number; deduped?: number };
+  stats: {
+    rows: number;
+    documents: number;
+    skipped: number;
+    issueCount: number;
+    deduped?: number;
+    byObjectType?: Record<string, number>;
+    skippedReasons?: Record<string, number>;
+  };
 };
 
 export type RelationEdgeSample = { sourceId: string; targetId: string };
@@ -114,6 +122,14 @@ export type ImportReport = {
   sourceLabel?: string;
   sourceKind?: "file" | "dataset" | "table";
   sourceName?: string;
+  routing?: {
+    total: number;
+    assigned: number;
+    skipped: number;
+    byObjectType: Record<string, number>;
+    skippedReasons?: Record<string, number>;
+    deduped?: number;
+  };
   mappingSummary?: Array<{
     objectTypeId: string;
     objectTypeName: string;
@@ -322,39 +338,74 @@ function coerceValue(value: unknown, type: FieldMapping["type"]): unknown {
 export function transformRecords(items: Array<Record<string, unknown>>, mapping: ImportMapping): TransformResult {
   const documents: Record<string, Array<Record<string, unknown>>> = {};
   const issues: TransformIssue[] = [];
-  let counts = 0;
+  const byObjectType: Record<string, number> = {};
+  const skippedReasons: Record<string, number> = {};
   let skipped = 0;
+  let counts = 0;
+
+  const noteSkip = (reason: string) => {
+    skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+  };
+
   for (const objectMapping of mapping.objects) {
     documents[objectMapping.objectTypeId] = documents[objectMapping.objectTypeId] ?? [];
+    byObjectType[objectMapping.objectTypeId] = 0;
   }
+
+  const multiMapping = mapping.objects.length > 1;
   items.forEach((row, index) => {
-    for (const objectMapping of mapping.objects) {
-      const doc: Record<string, unknown> = {};
-      let hasValue = false;
+    const ranked = mapping.objects.map((objectMapping) => {
+      let score = 0;
       for (const field of objectMapping.fields) {
-        const value = coerceValue(row[field.sourceColumn], field.type);
-        doc[field.propertyName] = value;
-        if (value !== null && !/^ref$/i.test(field.propertyName)) hasValue = true;
+        if (/^ref$/i.test(field.propertyName)) continue;
+        const value = row[field.sourceColumn];
+        if (value !== undefined && value !== null && String(value).trim() !== "") score += 1;
       }
-      if (!hasValue) {
-        skipped += 1;
-        continue;
-      }
-      const pk = objectMapping.primaryKeyColumn ? row[objectMapping.primaryKeyColumn] : undefined;
-      if (pk !== undefined && pk !== null && pk !== "") {
-        doc.id = String(pk);
-      } else {
-        doc.id = `${objectMapping.objectTypeName || objectMapping.objectTypeId}_${index + 1}`.replace(/\s+/g, "_");
-      }
-      if (doc.id === undefined || doc.id === "") {
-        issues.push({ row: index + 1, message: "缺少主键值，已跳过该行" });
-        skipped += 1;
-        continue;
-      }
-      documents[objectMapping.objectTypeId].push(doc);
-      counts += 1;
+      const pkValue = objectMapping.primaryKeyColumn ? row[objectMapping.primaryKeyColumn] : undefined;
+      const hasPrimaryKey =
+        pkValue !== undefined && pkValue !== null && String(pkValue).trim() !== "";
+      return { objectMapping, score, hasPrimaryKey };
+    });
+
+    // 多对象类映射时按行分派：优先有主键、其次字段命中数最多的对象类，
+    // 一行只写入一个对象类，避免同一份数据串写到多个对象类。
+    const selected = multiMapping
+      ? ranked
+          .filter((item) => item.score > 0)
+          .sort((left, right) => {
+            if (left.hasPrimaryKey !== right.hasPrimaryKey) return left.hasPrimaryKey ? -1 : 1;
+            return right.score - left.score;
+          })[0]
+      : ranked[0];
+
+    if (!selected || selected.score === 0) {
+      skipped += 1;
+      noteSkip(multiMapping ? "no_object_match" : "no_field_value");
+      return;
     }
+
+    const objectMapping = selected.objectMapping;
+    const doc: Record<string, unknown> = {};
+    for (const field of objectMapping.fields) {
+      doc[field.propertyName] = coerceValue(row[field.sourceColumn], field.type);
+    }
+    const pk = objectMapping.primaryKeyColumn ? row[objectMapping.primaryKeyColumn] : undefined;
+    if (pk !== undefined && pk !== null && pk !== "") {
+      doc.id = String(pk);
+    } else {
+      doc.id = `${objectMapping.objectTypeName || objectMapping.objectTypeId}_${index + 1}`.replace(/\s+/g, "_");
+    }
+    if (doc.id === undefined || doc.id === "") {
+      issues.push({ row: index + 1, message: "缺少主键值，已跳过该行" });
+      skipped += 1;
+      noteSkip("missing_primary_key");
+      return;
+    }
+    const bucket = documents[objectMapping.objectTypeId] ?? [];
+    bucket.push(doc);
+    documents[objectMapping.objectTypeId] = bucket;
   });
+
   let deduped = 0;
   for (const objectTypeId of Object.keys(documents)) {
     const seen = new Map<string, Record<string, unknown>>();
@@ -364,13 +415,22 @@ export function transformRecords(items: Array<Record<string, unknown>>, mapping:
       seen.set(key, doc);
     }
     documents[objectTypeId] = Array.from(seen.values());
+    byObjectType[objectTypeId] = documents[objectTypeId].length;
   }
   counts = Object.values(documents).reduce((sum, docs) => sum + docs.length, 0);
 
   return {
     documents,
     issues,
-    stats: { rows: items.length, documents: counts, skipped, issueCount: issues.length, deduped },
+    stats: {
+      rows: items.length,
+      documents: counts,
+      skipped,
+      issueCount: issues.length,
+      deduped,
+      byObjectType,
+      skippedReasons,
+    },
   };
 }
 
@@ -880,6 +940,14 @@ async function runImport(
   try {
     const transformed = transformRecords(filtered, mapping);
     report.issues = transformed.issues.slice(0, 200);
+    report.routing = {
+      total: filtered.length,
+      assigned: transformed.stats.documents,
+      skipped: transformed.stats.skipped,
+      byObjectType: transformed.stats.byObjectType ?? {},
+      skippedReasons: transformed.stats.skippedReasons,
+      deduped: transformed.stats.deduped ?? 0,
+    };
     if (requestedUpsert && !watermarkValue) {
       report.issues.push({ row: 0, message: "未提供水位：本次按主键 upsert（删除同主键旧文档后写入）" });
     }
