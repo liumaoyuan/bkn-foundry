@@ -135,21 +135,34 @@ export async function chatViaPlatform(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${MODEL_API_URL}${CHAT_PATH}`, {
-      method: "POST",
-      headers: bearer(token),
-      body: JSON.stringify({
-        model,
-        ...(options.modelId ? { model_id: options.modelId } : {}),
-        max_tokens: options.maxTokens ?? 8192,
-        messages,
-        stream: Boolean(options.stream),
-      }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error(`平台模型调用失败（HTTP ${response.status}）${text ? `：${text.slice(0, 300)}` : ""}`);
+    const requested = options.maxTokens ?? 8192;
+    const budgets = [requested];
+    for (const value of [4096, 2048, 1024]) {
+      if (value < requested) budgets.push(value);
+    }
+    let response: Response | null = null;
+    let lastText = "";
+    for (const budget of budgets) {
+      response = await fetch(`${MODEL_API_URL}${CHAT_PATH}`, {
+        method: "POST",
+        headers: bearer(token),
+        body: JSON.stringify({
+          model,
+          ...(options.modelId ? { model_id: options.modelId } : {}),
+          max_tokens: budget,
+          messages,
+          stream: Boolean(options.stream),
+        }),
+        signal: controller.signal,
+      });
+      if (response.ok) break;
+      lastText = await response.text().catch(() => "");
+      const retryable = /max_tokens|maximum context|context length|too many tokens|token/i.test(lastText);
+      if (!retryable) break;
+    }
+    if (!response || !response.ok) {
+      const status = response ? response.status : 0;
+      throw new Error(`平台模型调用失败（HTTP ${status}）${lastText ? `：${lastText.slice(0, 300)}` : ""}`);
     }
     if (!options.stream) {
       const payload = (await response.json()) as unknown;

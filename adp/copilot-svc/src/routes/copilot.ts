@@ -14,6 +14,15 @@ import {
 } from "../introspect.js";
 import { attachEvidence, type EvidenceSource } from "../evidence.js";
 import { dedupeRelations, dedupeWarning } from "../relations.js";
+import { checkAndRepairIr, summarizeIssues } from "../ir-check.js";
+import { extractIrStagedWithPlatform } from "../llm-staged.js";
+import {
+  applyNetworkEdit,
+  buildNetworkSchemaBrief,
+  planNetworkEdit,
+  rollbackNetworkEdit,
+  type NetworkEditOp,
+} from "../network-edit.js";
 import {
   extractDocument,
   extractRecords,
@@ -48,6 +57,7 @@ import {
 } from "../llm.js";
 import { listPlatformModels, type PlatformModel } from "../platform-model.js";
 import {
+  collectDatasetRecords,
   fetchDatasetRecords,
   importDataset,
   importFileRecords,
@@ -58,6 +68,7 @@ import {
   listDataDatasets,
   listDataSpaces,
   listImportHistory,
+  listDatasetSheets,
   profileDataset,
   profileRecords,
   suggestMapping,
@@ -67,6 +78,7 @@ import {
   findLastImport,
   listRelationMappings,
   updateRelationMapping,
+  ensureRelationMapping,
   watermarkCandidates,
   type ImportMapping,
   type ImportOptions,
@@ -336,6 +348,22 @@ export async function copilotRoutes(app: FastifyInstance) {
     }
   });
 
+  app.get("/data/datasets/:datasetId/sheets", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能读取数据集" });
+    const params = request.params as { datasetId?: string };
+    const spaceId = readSpaceId(request);
+    try {
+      const datasets = await listDataDatasets(token, spaceId);
+      const dataset = datasets.find((item) => item.id === params.datasetId);
+      if (!dataset) return reply.code(404).send({ ok: false, error: "数据集不存在" });
+      const sheets = await listDatasetSheets(token, spaceId, dataset.id);
+      return { ok: true, sheets };
+    } catch (error) {
+      return reply.code(502).send({ ok: false, error: dataImportError(error) });
+    }
+  });
+
   app.post("/data/preview", async (request, reply) => {
     const token = readToken(request as unknown as { headers: Record<string, unknown> });
     if (!token) return reply.code(401).send({ ok: false, error: "需要登录平台后才能导入数据" });
@@ -344,30 +372,54 @@ export async function copilotRoutes(app: FastifyInstance) {
       datasetId?: string;
       networkId?: string;
       mapping?: ImportMapping;
+      sheetName?: string;
     };
     if (!body.datasetId || !body.networkId) {
       return reply.code(400).send({ ok: false, error: "缺少 datasetId 或 networkId" });
     }
     const spaceId = body.spaceId ?? "default";
+    const sheetName = String(body.sheetName ?? "").trim();
     try {
       const datasets = await listDataDatasets(token, spaceId);
       const dataset = datasets.find((item) => item.id === body.datasetId);
       if (!dataset) return reply.code(404).send({ ok: false, error: "数据集不存在" });
+      const sheets = await listDatasetSheets(token, spaceId, dataset.id).catch(() => []);
       let mapping = body.mapping;
       let warnings: string[] = [];
       let objectTypes: Array<{ id: string; name: string; properties: Array<{ name: string; displayName: string; type: string }> }> = [];
+      const sampledItems = sheetName
+        ? (await collectDatasetRecords(token, spaceId, dataset.id, { sheetName, maxRecords: 400 })).slice(0, 50)
+        : (await fetchDatasetRecords(token, spaceId, dataset.id, 1, 50)).items;
       if (!mapping || mapping.objects.length === 0) {
-        const suggestion = await suggestMapping(token, spaceId, dataset, body.networkId);
-        mapping = suggestion.mapping;
-        warnings = suggestion.warnings;
-        objectTypes = suggestion.objectTypes;
+        if (sheetName) {
+          const sheetProfile = {
+            dataset,
+            total: sheets.find((item) => item.name === sheetName)?.rowCount ?? dataset.recordCount ?? sampledItems.length,
+            sampled: sampledItems.length,
+            fields: profileRecords(sampledItems),
+          };
+          const suggestion = await suggestMappingByProfile(token, body.networkId, sheetProfile, {
+            allowFallback: false,
+          });
+          mapping = suggestion.mapping;
+          warnings = suggestion.warnings;
+          objectTypes = suggestion.objectTypes;
+        } else {
+          const suggestion = await suggestMapping(token, spaceId, dataset, body.networkId);
+          mapping = suggestion.mapping;
+          warnings = suggestion.warnings;
+          objectTypes = suggestion.objectTypes;
+        }
       }
-      const page = await fetchDatasetRecords(token, spaceId, dataset.id, 1, 50);
-      const transformed = transformRecords(page.items, mapping);
-      const datasetLabel = `数据集「${dataset.name}」`;
+      const transformed = transformRecords(sampledItems, mapping);
+      const datasetLabel = sheetName
+        ? `数据集「${dataset.name}」·工作表「${sheetName}」`
+        : `数据集「${dataset.name}」`;
       return {
         ok: true,
         dataset,
+        sheets,
+        sheetName,
         mapping,
         objectTypes,
         warnings,
@@ -380,9 +432,11 @@ export async function copilotRoutes(app: FastifyInstance) {
             recordCount: dataset.recordCount,
             targetTable: dataset.targetTable,
           },
-          total: dataset.recordCount ?? 0,
-          sampled: page.items.length,
-          fields: profileRecords(page.items),
+          total: sheetName
+            ? (sheets.find((item) => item.name === sheetName)?.rowCount ?? dataset.recordCount ?? 0)
+            : (dataset.recordCount ?? 0),
+          sampled: sampledItems.length,
+          fields: profileRecords(sampledItems),
         }),
         lastImport: findLastImport(body.networkId, datasetLabel),
         stats: transformed.stats,
@@ -407,6 +461,7 @@ export async function copilotRoutes(app: FastifyInstance) {
       writeMode?: string;
       watermarkField?: string;
       watermarkValue?: string;
+      sheetName?: string;
     };
     if (!body.datasetId || !body.networkId || !body.mapping || body.mapping.objects.length === 0) {
       return reply.code(400).send({ ok: false, error: "缺少 datasetId / networkId / mapping" });
@@ -464,6 +519,7 @@ export async function copilotRoutes(app: FastifyInstance) {
       relationTypeId?: string;
       sourceProperty?: string;
       targetProperty?: string;
+      autoCreate?: boolean;
     };
     const networkId = String(body.networkId ?? "").trim();
     const relationTypeId = String(body.relationTypeId ?? "").trim();
@@ -475,8 +531,10 @@ export async function copilotRoutes(app: FastifyInstance) {
         .send({ ok: false, error: "缺少 networkId / relationTypeId / sourceProperty / targetProperty" });
     }
     try {
-      const item = await updateRelationMapping(token, networkId, relationTypeId, sourceProperty, targetProperty);
-      return { ok: true, item };
+      const result = await ensureRelationMapping(token, networkId, relationTypeId, sourceProperty, targetProperty, {
+        autoCreate: body.autoCreate !== false,
+      });
+      return { ok: true, item: result.mapping, createdProperties: result.createdProperties };
     } catch (error) {
       return reply.code(502).send({ ok: false, error: dataImportError(error) });
     }
@@ -516,12 +574,18 @@ export async function copilotRoutes(app: FastifyInstance) {
     writeMode?: string;
     watermarkField?: string;
     watermarkValue?: string;
+    sheetName?: string;
   }): ImportOptions => {
     const writeMode = body.writeMode === "upsert" ? "upsert" : "replace";
     const field = String(body.watermarkField ?? "").trim();
     const value = String(body.watermarkValue ?? "").trim();
-    if (writeMode !== "upsert") return { writeMode };
-    return { writeMode, watermark: field ? { field, value: value || undefined } : undefined };
+    const sheetName = String(body.sheetName ?? "").trim();
+    if (writeMode !== "upsert") return sheetName ? { writeMode, sheetName } : { writeMode };
+    return {
+      writeMode,
+      watermark: field ? { field, value: value || undefined } : undefined,
+      sheetName: sheetName || undefined,
+    };
   };
 
   app.post("/data/file/preview", async (request, reply) => {
@@ -915,6 +979,185 @@ export async function copilotRoutes(app: FastifyInstance) {
     reply.raw.end();
   });
 
+  // ---- 流式构建（NDJSON：逐条回传阶段进度与最终草案） ----
+  app.post("/analyze/stream", async (request, reply) => {
+    reply.raw.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
+    });
+    const send = (event: Record<string, unknown>) => {
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.write(JSON.stringify(event) + "\n");
+      }
+    };
+    try {
+      send({ type: "step", id: "parse", status: "running", label: "解析上传文件" });
+      const reportPieces: string[] = [];
+      const dataPieces: string[] = [];
+      const plainPieces: string[] = [];
+      const tables: ExtractedTable[] = [];
+      const evidenceSources: EvidenceSource[] = [];
+      const sqlSchemas: Schema[] = [];
+      const fileNames: string[] = [];
+      const fileErrors: string[] = [];
+      let networkName = "";
+      let pastedText = "";
+
+      if (request.isMultipart()) {
+        for await (const part of request.parts()) {
+          if (part.type === "file") {
+            const buffer = await part.toBuffer();
+            if (/\.(sql|ddl)$/i.test(part.filename)) {
+              try {
+                const parsed = parseSqlSchema(buffer.toString("utf8"));
+                if (parsed.tables.length > 0) sqlSchemas.push(parsed);
+              } catch {
+                // 解析失败按普通文本处理
+              }
+            }
+            try {
+              const extracted = await extractDocument(part.filename, buffer);
+              fileNames.push(extracted.fileName);
+              const sheetTables = await extractTables(part.filename, buffer);
+              tables.push(...sheetTables);
+              evidenceSources.push({ fileName: extracted.fileName, text: extracted.text });
+              const block = `## 文件：${extracted.fileName}\n${extracted.text}`;
+              if (part.fieldname === "reportFiles") reportPieces.push(block);
+              else if (part.fieldname === "dataFiles") dataPieces.push(block);
+              else plainPieces.push(block);
+            } catch (error) {
+              fileErrors.push(error instanceof Error ? error.message : String(error));
+            }
+          } else if (part.fieldname === "text") {
+            pastedText += String(part.value ?? "");
+          } else if (part.fieldname === "networkName") {
+            networkName = String(part.value ?? "");
+          }
+        }
+      } else {
+        const body = (request.body ?? {}) as AnalyzeJsonBody;
+        pastedText = body.text ?? "";
+        networkName = body.networkName ?? "";
+      }
+
+      const mergedSchema = mergeSchemas(sqlSchemas);
+      const schemaMode = mergedSchema.tables.length > 0;
+      const schemaBrief = schemaMode ? buildSchemaBrief(mergedSchema) : "";
+      const sourceText = schemaMode
+        ? [schemaBrief, ...(pastedText.trim() ? [`## 补充说明\n${pastedText}`] : [])].join("\n\n")
+        : composeAnalyzeSource({ report: reportPieces, data: dataPieces, plain: plainPieces, pasted: pastedText });
+
+      send({
+        type: "step",
+        id: "parse",
+        status: "done",
+        label: "解析上传文件",
+        detail: `${fileNames.length} 个文件 / 约 ${sourceText.length} 字${fileErrors.length ? ` / ${fileErrors.length} 个失败` : ""}`,
+      });
+
+      let mode: "llm" | "heuristic" = "heuristic";
+      let raw: unknown = null;
+      let llmError: string | undefined;
+      const settings = readModelSettings();
+      const token = readToken(request as unknown as { headers: Record<string, unknown> });
+      const platformAnalysis = settings?.mode === "platform" && Boolean(settings.platformModel) && Boolean(token);
+
+      if (platformAnalysis && settings?.platformModel) {
+        const modelName = (settings.platformModelName ?? settings.platformModel).trim();
+        const staged = await extractIrStagedWithPlatform(
+          token,
+          modelName,
+          settings.platformModel,
+          sourceText,
+          (event) => {
+            send({
+              type: "step",
+              id: event.stage,
+              status: event.status,
+              label:
+                event.stage === "objects"
+                  ? "抽取对象类与属性"
+                  : event.stage === "relations"
+                    ? "抽取关系类型"
+                    : "抽取行动与风险",
+              detail: event.detail,
+              ms: event.ms,
+              error: event.error,
+            });
+          },
+        );
+        if (staged.ok) {
+          raw = staged.raw;
+          mode = "llm";
+        } else {
+          llmError = staged.error;
+        }
+        if (raw === null) {
+          send({ type: "step", id: "fallback", status: "running", label: "回退为单轮抽取" });
+          const result = await extractIrWithPlatform(token, modelName, settings.platformModel, sourceText);
+          if ("raw" in result) {
+            raw = result.raw;
+            mode = "llm";
+          } else {
+            llmError = result.error;
+          }
+          send({ type: "step", id: "fallback", status: "done", label: "回退为单轮抽取" });
+        }
+      }
+
+      if (raw === null) {
+        send({ type: "step", id: "heuristic", status: "running", label: "规则模式生成草案" });
+        const schemaFallback = schemaMode ? schemaToIr(mergedSchema, networkName || fileNames[0] || "数据库知识网络") : null;
+        raw = schemaFallback ?? heuristicExtract(sourceText, networkName || fileNames[0]);
+        send({ type: "step", id: "heuristic", status: "done", label: "规则模式生成草案" });
+      }
+
+      send({ type: "step", id: "normalize", status: "running", label: "结构校验与修复" });
+      const normalized = normalizeIr(raw);
+      if (!normalized.ok) {
+        send({ type: "result", ok: false, errors: normalized.errors, mode });
+        reply.raw.end();
+        return;
+      }
+      const repaired = checkAndRepairIr(normalized.ir);
+      const repairWarnings = repaired.issues
+        .filter((issue) => issue.level === "warning")
+        .map((issue) => (issue.fixed ? `已自动修复：${issue.message}` : issue.message));
+      send({
+        type: "step",
+        id: "normalize",
+        status: "done",
+        label: "结构校验与修复",
+        detail: `${repaired.issues.length} 条提示 / 修复 ${repaired.issues.filter((issue) => issue.fixed).length} 处`,
+      });
+
+      const deduped = dedupeRelations(repaired.ir.relations);
+      const dedupedIr = { ...repaired.ir, relations: deduped.relations };
+      send({ type: "step", id: "bind", status: "running", label: "推断数据绑定与证据" });
+      const binding = inferIrBindings(
+        dedupedIr,
+        schemaMode ? [...tables, ...schemaToTables(mergedSchema)] : tables,
+      );
+      const grounded = attachEvidence(binding.ir, evidenceSources);
+      send({ type: "step", id: "bind", status: "done", label: "推断数据绑定与证据" });
+
+      send({
+        type: "result",
+        ok: true,
+        mode,
+        llmError,
+        files: fileNames,
+        warnings: [...normalized.warnings, ...repairWarnings, ...binding.warnings, ...fileErrors],
+        ir: grounded.ir,
+      });
+      reply.raw.end();
+    } catch (error) {
+      send({ type: "result", ok: false, error: error instanceof Error ? error.message : "流式构建失败" });
+      if (!reply.raw.writableEnded) reply.raw.end();
+    }
+  });
+
   app.post("/analyze", async (request, reply) => {
     const reportPieces: string[] = [];
     const dataPieces: string[] = [];
@@ -1014,17 +1257,38 @@ export async function copilotRoutes(app: FastifyInstance) {
     const manualAnalysis = analysisSettings?.mode === "manual" && isLlmConfigured();
 
     if (platformAnalysis && analysisSettings?.platformModel) {
-      const result = await extractIrWithPlatform(
-        analysisToken,
-        (analysisSettings.platformModelName ?? analysisSettings.platformModel).trim(),
-        analysisSettings.platformModel,
-        sourceText,
-      );
-      if ("raw" in result) {
-        raw = result.raw;
-        mode = "llm";
-      } else {
-        llmError = result.error;
+      const modelName = (analysisSettings.platformModelName ?? analysisSettings.platformModel).trim();
+      const stagedEnabled =
+        process.env.COPILOT_STAGED_EXTRACT !== "0" &&
+        String(request.headers["x-copilot-staged"] ?? "") !== "0";
+      if (stagedEnabled) {
+        const staged = await extractIrStagedWithPlatform(
+          analysisToken,
+          modelName,
+          analysisSettings.platformModel,
+          sourceText,
+        );
+        if (staged.ok) {
+          raw = staged.raw;
+          mode = "llm";
+          for (const item of staged.warnings) openQuestions.push(item);
+        } else {
+          llmError = staged.error;
+        }
+      }
+      if (raw === null) {
+        const result = await extractIrWithPlatform(
+          analysisToken,
+          modelName,
+          analysisSettings.platformModel,
+          sourceText,
+        );
+        if ("raw" in result) {
+          raw = result.raw;
+          mode = "llm";
+        } else {
+          llmError = result.error;
+        }
       }
     } else if (schemaMode && manualAnalysis) {
       const result = await extractIrFromSchema(sourceText);
@@ -1069,8 +1333,13 @@ export async function copilotRoutes(app: FastifyInstance) {
       return { ok: false, errors: normalized.errors, mode };
     }
 
-    const deduped = dedupeRelations(normalized.ir.relations);
-    const dedupedIr = { ...normalized.ir, relations: deduped.relations };
+    const repaired = checkAndRepairIr(normalized.ir);
+    const repairWarnings = repaired.issues
+      .filter((issue) => issue.level === "warning")
+      .map((issue) => (issue.fixed ? `已自动修复：${issue.message}` : issue.message));
+
+    const deduped = dedupeRelations(repaired.ir.relations);
+    const dedupedIr = { ...repaired.ir, relations: deduped.relations };
 
     if (pastedText.trim()) {
       evidenceSources.push({ fileName: "粘贴文本", text: pastedText });
@@ -1090,6 +1359,7 @@ export async function copilotRoutes(app: FastifyInstance) {
       characters: sourceText.length,
       warnings: [
         ...normalized.warnings,
+        ...repairWarnings,
         ...(dedupeWarning(deduped) ? [dedupeWarning(deduped) as string] : []),
         ...health.map((item) => item.message),
         ...bindingWarnings(binding.stats),
@@ -1119,6 +1389,26 @@ export async function copilotRoutes(app: FastifyInstance) {
     };
   });
 
+  app.post("/ir/check", async (request, reply) => {
+    const body = (request.body ?? {}) as { ir?: unknown };
+    if (!body.ir || typeof body.ir !== "object") {
+      reply.code(400);
+      return { ok: false, error: "缺少 ir" };
+    }
+    const repaired = checkAndRepairIr(body.ir as OntologyIr);
+    const normalized = normalizeIr(repaired.ir);
+    if (!normalized.ok) {
+      reply.code(422);
+      return { ok: false, errors: normalized.errors, issues: repaired.issues };
+    }
+    return {
+      ok: true,
+      ir: normalized.ir,
+      changed: repaired.changed,
+      issues: repaired.issues,
+      summary: summarizeIssues(repaired.issues),
+    };
+  });
   app.post("/introspect/test", async (request, reply) => {
     const normalized = normalizeIntrospectTarget(request.body);
     if (!normalized.ok) {
@@ -1350,5 +1640,194 @@ export async function copilotRoutes(app: FastifyInstance) {
       .header("Content-Type", "application/zip")
       .header("Content-Disposition", `attachment; filename="${folderName}.zip"`);
     return reply.send(Buffer.from(zipped));
+  });
+
+  // ---- 线上网络结构（AI 编辑：预览 → 执行 → 回滚） ----
+  app.post("/network/:networkId/plan/stream", async (request, reply) => {
+    reply.raw.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
+    });
+    const send = (event: Record<string, unknown>) => {
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.write(JSON.stringify(event) + "\n");
+      }
+    };
+    try {
+      const token = readToken(request as unknown as { headers: Record<string, unknown> });
+      if (!token) {
+        send({ type: "result", ok: false, error: "需要登录平台后才能使用 AI 编辑" });
+        reply.raw.end();
+        return;
+      }
+      const { networkId } = request.params as { networkId: string };
+      const body = (request.body ?? {}) as { message?: string };
+      const message = String(body.message ?? "").trim();
+      if (!message) {
+        send({ type: "result", ok: false, error: "请描述要修改的内容" });
+        reply.raw.end();
+        return;
+      }
+      const settings = readModelSettings();
+      if (!settings || settings.mode !== "platform" || !settings.platformModel) {
+        send({ type: "result", ok: false, error: "AI 编辑需要平台模型模式，请先在「模型连接」选择平台模型" });
+        reply.raw.end();
+        return;
+      }
+      const modelName = (settings.platformModelName ?? settings.platformModel).trim();
+      const plan = await planNetworkEdit(
+        token,
+        modelName,
+        settings.platformModel,
+        networkId,
+        message,
+        (event) => {
+          send({
+            type: "step",
+            id: event.stage,
+            status: event.status,
+            label:
+              event.stage === "schema"
+                ? "读取网络结构"
+                : event.stage === "model"
+                  ? "模型生成变更计划"
+                  : "执行变更",
+            detail: event.detail,
+            error: event.error,
+          });
+        },
+      );
+      send({ type: "result", ok: true, plan });
+      reply.raw.end();
+    } catch (error) {
+      send({ type: "result", ok: false, error: error instanceof Error ? error.message : "生成变更计划失败" });
+      if (!reply.raw.writableEnded) reply.raw.end();
+    }
+  });
+
+  app.post("/network/:networkId/apply/stream", async (request, reply) => {
+    reply.raw.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
+    });
+    const send = (event: Record<string, unknown>) => {
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.write(JSON.stringify(event) + "\n");
+      }
+    };
+    try {
+      const token = readToken(request as unknown as { headers: Record<string, unknown> });
+      if (!token) {
+        send({ type: "result", ok: false, error: "需要登录平台后才能执行变更" });
+        reply.raw.end();
+        return;
+      }
+      const { networkId } = request.params as { networkId: string };
+      const body = (request.body ?? {}) as { ops?: NetworkEditOp[] };
+      const ops = Array.isArray(body.ops) ? body.ops : [];
+      if (ops.length === 0) {
+        send({ type: "result", ok: false, error: "没有可执行的变更" });
+        reply.raw.end();
+        return;
+      }
+      const result = await applyNetworkEdit(token, networkId, ops, (event) => {
+        send({ type: "step", id: `op-${event.index}`, status: "running", index: event.index, total: event.total });
+      });
+      send({ type: "result", ok: true, result });
+      reply.raw.end();
+    } catch (error) {
+      send({ type: "result", ok: false, error: error instanceof Error ? error.message : "执行变更失败" });
+      if (!reply.raw.writableEnded) reply.raw.end();
+    }
+  });
+
+  app.get("/network/:networkId/schema", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) {
+      reply.code(401);
+      return { ok: false, error: "需要登录平台后才能查看网络结构" };
+    }
+    const { networkId } = request.params as { networkId: string };
+    try {
+      const schema = await buildNetworkSchemaBrief(token, networkId);
+      return { ok: true, schema };
+    } catch (error) {
+      reply.code(502);
+      return { ok: false, error: error instanceof Error ? error.message : "读取网络结构失败" };
+    }
+  });
+
+  app.post("/network/:networkId/plan", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) {
+      reply.code(401);
+      return { ok: false, error: "需要登录平台后才能使用 AI 编辑" };
+    }
+    const { networkId } = request.params as { networkId: string };
+    const body = (request.body ?? {}) as { message?: string };
+    const message = String(body.message ?? "").trim();
+    if (!message) {
+      reply.code(400);
+      return { ok: false, error: "请描述要修改的内容" };
+    }
+    const settings = readModelSettings();
+    if (!settings || settings.mode !== "platform" || !settings.platformModel) {
+      reply.code(400);
+      return { ok: false, error: "AI 编辑需要平台模型模式，请先在「模型连接」选择平台模型" };
+    }
+    const modelName = (settings.platformModelName ?? settings.platformModel).trim();
+    try {
+      const plan = await planNetworkEdit(token, modelName, settings.platformModel, networkId, message);
+      return { ok: true, plan };
+    } catch (error) {
+      reply.code(502);
+      return { ok: false, error: error instanceof Error ? error.message : "生成变更计划失败" };
+    }
+  });
+
+  app.post("/network/:networkId/apply", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) {
+      reply.code(401);
+      return { ok: false, error: "需要登录平台后才能执行变更" };
+    }
+    const { networkId } = request.params as { networkId: string };
+    const body = (request.body ?? {}) as { ops?: NetworkEditOp[] };
+    const ops = Array.isArray(body.ops) ? body.ops : [];
+    if (ops.length === 0) {
+      reply.code(400);
+      return { ok: false, error: "没有可执行的变更" };
+    }
+    try {
+      const result = await applyNetworkEdit(token, networkId, ops);
+      return { ok: true, result };
+    } catch (error) {
+      reply.code(502);
+      return { ok: false, error: error instanceof Error ? error.message : "执行变更失败" };
+    }
+  });
+
+  app.post("/network/:networkId/rollback", async (request, reply) => {
+    const token = readToken(request as unknown as { headers: Record<string, unknown> });
+    if (!token) {
+      reply.code(401);
+      return { ok: false, error: "需要登录平台后才能回滚" };
+    }
+    const { networkId } = request.params as { networkId: string };
+    const body = (request.body ?? {}) as { snapshotId?: string };
+    const snapshotId = String(body.snapshotId ?? "").trim();
+    if (!snapshotId) {
+      reply.code(400);
+      return { ok: false, error: "缺少 snapshotId" };
+    }
+    try {
+      const result = await rollbackNetworkEdit(token, networkId, snapshotId);
+      return { ok: true, result };
+    } catch (error) {
+      reply.code(502);
+      return { ok: false, error: error instanceof Error ? error.message : "回滚失败" };
+    }
   });
 }

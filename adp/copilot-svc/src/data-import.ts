@@ -67,6 +67,7 @@ export type ImportWatermark = { field: string; value?: string };
 export type ImportOptions = {
   writeMode?: ImportWriteMode;
   watermark?: ImportWatermark;
+  sheetName?: string;
 };
 
 export type TransformIssue = { row: number; field?: string; message: string };
@@ -74,7 +75,15 @@ export type TransformIssue = { row: number; field?: string; message: string };
 export type TransformResult = {
   documents: Record<string, Array<Record<string, unknown>>>;
   issues: TransformIssue[];
-  stats: { rows: number; documents: number; skipped: number; issueCount: number; deduped?: number };
+  stats: {
+    rows: number;
+    documents: number;
+    skipped: number;
+    issueCount: number;
+    deduped?: number;
+    byObjectType?: Record<string, number>;
+    skippedReasons?: Record<string, number>;
+  };
 };
 
 export type RelationEdgeSample = { sourceId: string; targetId: string };
@@ -114,6 +123,14 @@ export type ImportReport = {
   sourceLabel?: string;
   sourceKind?: "file" | "dataset" | "table";
   sourceName?: string;
+  routing?: {
+    total: number;
+    assigned: number;
+    skipped: number;
+    byObjectType: Record<string, number>;
+    skippedReasons?: Record<string, number>;
+    deduped?: number;
+  };
   mappingSummary?: Array<{
     objectTypeId: string;
     objectTypeName: string;
@@ -224,6 +241,72 @@ export async function fetchDatasetRecords(
   return { total: Number(raw.total ?? 0), items };
 }
 
+export const SHEET_NAME_KEY = "__sheet_name";
+
+export type DatasetSheetInfo = {
+  name: string;
+  index: number;
+  rowCount: number;
+  columns: string[];
+};
+
+function sheetNameOf(item: Record<string, unknown>): string {
+  const value = item[SHEET_NAME_KEY];
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+export function filterRecordsBySheet(
+  items: Array<Record<string, unknown>>,
+  sheetName?: string,
+): Array<Record<string, unknown>> {
+  if (!sheetName) return items;
+  return items.filter((item) => sheetNameOf(item) === sheetName);
+}
+
+export async function collectDatasetRecords(
+  token: string,
+  spaceId: string,
+  datasetId: string,
+  options: { sheetName?: string; maxRecords?: number } = {},
+): Promise<Array<Record<string, unknown>>> {
+  const limit = options.maxRecords ?? MAX_RECORDS;
+  const collected: Array<Record<string, unknown>> = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const chunk = await fetchDatasetRecords(token, spaceId, datasetId, page, 200);
+    if (chunk.items.length === 0) break;
+    collected.push(...filterRecordsBySheet(chunk.items, options.sheetName));
+    if (collected.length >= limit) break;
+    if (chunk.total > 0 && page * 200 >= chunk.total) break;
+  }
+  return collected.slice(0, limit);
+}
+
+export async function listDatasetSheets(
+  token: string,
+  spaceId: string,
+  datasetId: string,
+): Promise<DatasetSheetInfo[]> {
+  const items = await collectDatasetRecords(token, spaceId, datasetId);
+  const grouped = new Map<string, { rowCount: number; columns: Set<string> }>();
+  for (const item of items) {
+    const name = sheetNameOf(item);
+    const entry = grouped.get(name) ?? { rowCount: 0, columns: new Set<string>() };
+    entry.rowCount += 1;
+    for (const [key, value] of Object.entries(item)) {
+      if (key.startsWith("__")) continue;
+      if (value === null || value === undefined || value === "") continue;
+      entry.columns.add(key);
+    }
+    grouped.set(name, entry);
+  }
+  return [...grouped.entries()].map(([name, entry], index) => ({
+    name,
+    index,
+    rowCount: entry.rowCount,
+    columns: [...entry.columns],
+  }));
+}
+
 function inferValueType(values: unknown[]): ImportFieldProfile["type"] {
   let numbers = 0;
   let dates = 0;
@@ -322,39 +405,74 @@ function coerceValue(value: unknown, type: FieldMapping["type"]): unknown {
 export function transformRecords(items: Array<Record<string, unknown>>, mapping: ImportMapping): TransformResult {
   const documents: Record<string, Array<Record<string, unknown>>> = {};
   const issues: TransformIssue[] = [];
-  let counts = 0;
+  const byObjectType: Record<string, number> = {};
+  const skippedReasons: Record<string, number> = {};
   let skipped = 0;
+  let counts = 0;
+
+  const noteSkip = (reason: string) => {
+    skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+  };
+
   for (const objectMapping of mapping.objects) {
     documents[objectMapping.objectTypeId] = documents[objectMapping.objectTypeId] ?? [];
+    byObjectType[objectMapping.objectTypeId] = 0;
   }
+
+  const multiMapping = mapping.objects.length > 1;
   items.forEach((row, index) => {
-    for (const objectMapping of mapping.objects) {
-      const doc: Record<string, unknown> = {};
-      let hasValue = false;
+    const ranked = mapping.objects.map((objectMapping) => {
+      let score = 0;
       for (const field of objectMapping.fields) {
-        const value = coerceValue(row[field.sourceColumn], field.type);
-        doc[field.propertyName] = value;
-        if (value !== null && !/^ref$/i.test(field.propertyName)) hasValue = true;
+        if (/^ref$/i.test(field.propertyName)) continue;
+        const value = row[field.sourceColumn];
+        if (value !== undefined && value !== null && String(value).trim() !== "") score += 1;
       }
-      if (!hasValue) {
-        skipped += 1;
-        continue;
-      }
-      const pk = objectMapping.primaryKeyColumn ? row[objectMapping.primaryKeyColumn] : undefined;
-      if (pk !== undefined && pk !== null && pk !== "") {
-        doc.id = String(pk);
-      } else {
-        doc.id = `${objectMapping.objectTypeName || objectMapping.objectTypeId}_${index + 1}`.replace(/\s+/g, "_");
-      }
-      if (doc.id === undefined || doc.id === "") {
-        issues.push({ row: index + 1, message: "缺少主键值，已跳过该行" });
-        skipped += 1;
-        continue;
-      }
-      documents[objectMapping.objectTypeId].push(doc);
-      counts += 1;
+      const pkValue = objectMapping.primaryKeyColumn ? row[objectMapping.primaryKeyColumn] : undefined;
+      const hasPrimaryKey =
+        pkValue !== undefined && pkValue !== null && String(pkValue).trim() !== "";
+      return { objectMapping, score, hasPrimaryKey };
+    });
+
+    // 多对象类映射时按行分派：优先有主键、其次字段命中数最多的对象类，
+    // 一行只写入一个对象类，避免同一份数据串写到多个对象类。
+    const selected = multiMapping
+      ? ranked
+          .filter((item) => item.score > 0)
+          .sort((left, right) => {
+            if (left.hasPrimaryKey !== right.hasPrimaryKey) return left.hasPrimaryKey ? -1 : 1;
+            return right.score - left.score;
+          })[0]
+      : ranked[0];
+
+    if (!selected || selected.score === 0) {
+      skipped += 1;
+      noteSkip(multiMapping ? "no_object_match" : "no_field_value");
+      return;
     }
+
+    const objectMapping = selected.objectMapping;
+    const doc: Record<string, unknown> = {};
+    for (const field of objectMapping.fields) {
+      doc[field.propertyName] = coerceValue(row[field.sourceColumn], field.type);
+    }
+    const pk = objectMapping.primaryKeyColumn ? row[objectMapping.primaryKeyColumn] : undefined;
+    if (pk !== undefined && pk !== null && pk !== "") {
+      doc.id = String(pk);
+    } else {
+      doc.id = `${objectMapping.objectTypeName || objectMapping.objectTypeId}_${index + 1}`.replace(/\s+/g, "_");
+    }
+    if (doc.id === undefined || doc.id === "") {
+      issues.push({ row: index + 1, message: "缺少主键值，已跳过该行" });
+      skipped += 1;
+      noteSkip("missing_primary_key");
+      return;
+    }
+    const bucket = documents[objectMapping.objectTypeId] ?? [];
+    bucket.push(doc);
+    documents[objectMapping.objectTypeId] = bucket;
   });
+
   let deduped = 0;
   for (const objectTypeId of Object.keys(documents)) {
     const seen = new Map<string, Record<string, unknown>>();
@@ -364,13 +482,22 @@ export function transformRecords(items: Array<Record<string, unknown>>, mapping:
       seen.set(key, doc);
     }
     documents[objectTypeId] = Array.from(seen.values());
+    byObjectType[objectTypeId] = documents[objectTypeId].length;
   }
   counts = Object.values(documents).reduce((sum, docs) => sum + docs.length, 0);
 
   return {
     documents,
     issues,
-    stats: { rows: items.length, documents: counts, skipped, issueCount: issues.length, deduped },
+    stats: {
+      rows: items.length,
+      documents: counts,
+      skipped,
+      issueCount: issues.length,
+      deduped,
+      byObjectType,
+      skippedReasons,
+    },
   };
 }
 
@@ -644,6 +771,7 @@ export async function suggestMappingByProfile(
   token: string,
   networkId: string,
   profile: DatasetProfile,
+  options: { allowFallback?: boolean } = {},
 ) {
   const objectTypes = await listObjectTypes(token, networkId);
   const detailed: Array<{
@@ -672,19 +800,36 @@ export async function suggestMappingByProfile(
   }
   const warnings: string[] = [];
   const normalized = (value: string) => value.toLowerCase().replace(/[\s_\-()（）:：]/g, "");
+  const looseKey = (value: string) =>
+    normalized(value).replace(/提取|原文|文本|吨|数量|条|代码|说明|路径|时间|日期|名称|号/g, "");
   const columns = profile.fields;
 
   type Candidate = { objectType: (typeof detailed)[number]; fields: FieldMapping[]; score: number };
   const candidates: Candidate[] = [];
   for (const candidate of detailed) {
     const fields: FieldMapping[] = [];
+    const usedColumns = new Set<string>();
     for (const property of candidate.properties) {
-      const match = columns.find(
+      const exact = columns.find(
         (field) =>
-          normalized(field.name) === normalized(property.name) ||
-          normalized(field.name) === normalized(property.displayName),
+          !usedColumns.has(field.name) &&
+          (normalized(field.name) === normalized(property.name) ||
+            normalized(field.name) === normalized(property.displayName)),
       );
+      const propKey = looseKey(property.displayName);
+      const fuzzy =
+        exact ??
+        columns.find((field) => {
+          if (usedColumns.has(field.name)) return false;
+          const columnKey = looseKey(field.name);
+          if (!columnKey) return false;
+          if (columnKey === propKey) return true;
+          if (propKey.length < 3) return false;
+          return propKey.includes(columnKey) || columnKey.includes(propKey);
+        });
+      const match = exact ?? fuzzy;
       if (!match) continue;
+      usedColumns.add(match.name);
       fields.push({
         sourceColumn: match.name,
         propertyName: property.name,
@@ -701,6 +846,10 @@ export async function suggestMappingByProfile(
   const picked = candidates.slice(0, 3);
 
   if (picked.length === 0) {
+    if (options.allowFallback === false) {
+      warnings.push("该工作表未匹配到对象类型，请手动选择字段映射或跳过此工作表");
+      return { profile, objectTypes: detailed, mapping: { objects: [] }, warnings };
+    }
     const fallback = detailed[0];
     if (!fallback) {
       return { profile, objectTypes: detailed, mapping: { objects: [] }, warnings: ["目标知识网络没有对象类型"] };
@@ -880,6 +1029,14 @@ async function runImport(
   try {
     const transformed = transformRecords(filtered, mapping);
     report.issues = transformed.issues.slice(0, 200);
+    report.routing = {
+      total: filtered.length,
+      assigned: transformed.stats.documents,
+      skipped: transformed.stats.skipped,
+      byObjectType: transformed.stats.byObjectType ?? {},
+      skippedReasons: transformed.stats.skippedReasons,
+      deduped: transformed.stats.deduped ?? 0,
+    };
     if (requestedUpsert && !watermarkValue) {
       report.issues.push({ row: 0, message: "未提供水位：本次按主键 upsert（删除同主键旧文档后写入）" });
     }
@@ -902,7 +1059,6 @@ async function runImport(
       report.objects.push(entry);
       const docs = transformed.documents[objectMapping.objectTypeId] ?? [];
       if (docs.length === 0) {
-        entry.error = "没有可写入的记录（映射结果为空）";
         continue;
       }
       try {
@@ -1001,20 +1157,15 @@ export async function importDataset(
   mapping: ImportMapping,
   options: ImportOptions = {},
 ): Promise<ImportReport> {
-  const collected: Array<Record<string, unknown>> = [];
-  let page = 1;
-  while (collected.length < MAX_RECORDS) {
-    const result = await fetchDatasetRecords(token, spaceId, dataset.id, page, 200);
-    if (result.items.length === 0) break;
-    collected.push(...result.items);
-    if (collected.length >= result.total) break;
-    page += 1;
-  }
+  const collected = await collectDatasetRecords(token, spaceId, dataset.id, {
+    sheetName: options.sheetName,
+  });
+  const sheetSuffix = options.sheetName ? `·工作表「${options.sheetName}」` : "";
   return runImport(token, networkId, mapping, collected, {
-    datasetId: dataset.id,
-    sourceLabel: `数据集「${dataset.name}」`,
+    datasetId: dataset.id + (options.sheetName ? "::" + options.sheetName : ""),
+    sourceLabel: `数据集「${dataset.name}」${sheetSuffix}`,
     sourceKind: "dataset",
-    sourceName: dataset.name,
+    sourceName: options.sheetName || dataset.name,
   }, options);
 }
 
@@ -1147,6 +1298,84 @@ export async function updateRelationMapping(
       },
     ],
   });
+}
+
+type CreatedRelationProperty = {
+  objectTypeId: string;
+  objectTypeName?: string;
+  propertyName: string;
+  side: "source" | "target";
+};
+
+async function readRelationTypeDetail(
+  token: string,
+  networkId: string,
+  relationTypeId: string,
+): Promise<PlatformRelationType> {
+  const url = `${GATEWAY_BASE}/api/bkn-backend/v1/knowledge-networks/${encodeURIComponent(
+    networkId,
+  )}/relation-types/${encodeURIComponent(relationTypeId)}`;
+  const detail = await getJson<{ entries?: PlatformRelationType[] } | PlatformRelationType[]>(url, token);
+  const entry = Array.isArray(detail) ? detail[0] : detail.entries?.[0];
+  if (!entry) throw new Error("关系类型不存在：" + relationTypeId);
+  return entry;
+}
+
+async function ensureObjectTypeProperty(
+  token: string,
+  networkId: string,
+  objectTypeId: string | undefined,
+  propertyName: string,
+): Promise<{ objectTypeName?: string } | null> {
+  if (!objectTypeId || !propertyName) return null;
+  const objectType = await getObjectType(token, networkId, objectTypeId);
+  const properties = Array.isArray(objectType.data_properties) ? [...objectType.data_properties] : [];
+  if (properties.some((property) => property.name === propertyName)) return null;
+  const nextProperties = [
+    ...properties,
+    { name: propertyName, display_name: propertyName, type: "string" },
+  ];
+  await sendJson(
+    "PUT",
+    `${GATEWAY_BASE}/api/bkn-backend/v1/knowledge-networks/${encodeURIComponent(
+      networkId,
+    )}/object-types/${encodeURIComponent(objectTypeId)}`,
+    token,
+    { ...objectType, data_properties: nextProperties },
+    60000,
+  );
+  return { objectTypeName: objectType.name };
+}
+
+export async function ensureRelationMapping(
+  token: string,
+  networkId: string,
+  relationTypeId: string,
+  sourceProperty: string,
+  targetProperty: string,
+  options: { autoCreate?: boolean } = {},
+): Promise<{ mapping: RelationMappingInfo; createdProperties: CreatedRelationProperty[] }> {
+  const entry = await readRelationTypeDetail(token, networkId, relationTypeId);
+  const createdProperties: CreatedRelationProperty[] = [];
+  if (options.autoCreate !== false) {
+    const required: Array<{ side: "source" | "target"; objectTypeId?: string; propertyName: string }> = [
+      { side: "source", objectTypeId: entry.source_object_type_id, propertyName: sourceProperty },
+      { side: "target", objectTypeId: entry.target_object_type_id, propertyName: targetProperty },
+    ];
+    for (const item of required) {
+      const created = await ensureObjectTypeProperty(token, networkId, item.objectTypeId, item.propertyName);
+      if (created) {
+        createdProperties.push({
+          objectTypeId: item.objectTypeId ?? "",
+          objectTypeName: created.objectTypeName,
+          propertyName: item.propertyName,
+          side: item.side,
+        });
+      }
+    }
+  }
+  const mapping = await updateRelationMapping(token, networkId, relationTypeId, sourceProperty, targetProperty);
+  return { mapping, createdProperties };
 }
 
 async function listRelationTypes(token: string, networkId: string): Promise<PlatformRelationType[]> {
