@@ -16,8 +16,9 @@ OpenBKN Studio.
 ## Architecture
 
 - Public API: `/api` on port `8000` behind the OpenBKN gateway prefix `/api/data-ingestion`
-- Database: an external MySQL/MariaDB control database plus user-selected external
-  MySQL/MariaDB databases for each data space; it never writes Vega or BKN tables
+- Database: an external MySQL/MariaDB/PostgreSQL control database plus
+  user-selected external databases for each data space; it never writes Vega or
+  BKN tables
 - Objects: existing OpenBKN MinIO/S3
 - Scheduled scans: one replica because the first release uses an in-process scheduler
 - Built-in Agent: the platform default large model from OpenBKN Model Management

@@ -27,6 +27,10 @@ ingress:
   pathType: ImplementationSpecific
 
 database:
+  # Full SQLAlchemy URL for an externally managed control database.
+  # Supports mysql+pymysql, mariadb+pymysql, and postgresql+psycopg.
+  # When set, this value takes precedence over host/port/name/user below.
+  url: ""
   host: mariadb
   port: 3306
   name: data_ingestion

@@ -193,15 +193,34 @@ class DedicatedRecordStorageTest(unittest.TestCase):
                     "fingerprint": "fp-1",
                     "data_type": "row",
                     "asset_path": "",
+                    "source_id": "source-db",
+                    "source_object": "customers",
                     "row_index": 0,
                     "payload": {"id": 1, "value": "old"},
                     "created_at": created_at,
-                }
+                },
+                {
+                    "id": "record-2",
+                    "run_id": "run-1",
+                    "fingerprint": "fp-2",
+                    "data_type": "row",
+                    "asset_path": "",
+                    "source_id": "source-db",
+                    "source_object": "orders",
+                    "row_index": 0,
+                    "payload": {"id": 1, "value": "old"},
+                    "created_at": created_at,
+                },
             ],
         )
         self.assertEqual(
-            backfill_dedicated_record_keys(engine, table_name, ["id"]),
-            1,
+            backfill_dedicated_record_keys(
+                engine,
+                table_name,
+                ["id"],
+                scoped_source_ids={"source-db"},
+            ),
+            2,
         )
         _, items = page_dedicated_records(
             engine,
@@ -210,7 +229,7 @@ class DedicatedRecordStorageTest(unittest.TestCase):
             page_size=10,
             query="",
         )
-        self.assertTrue(items[0]["record_key"])
+        self.assertEqual(len({item["record_key"] for item in items}), 2)
 
 
 if __name__ == "__main__":

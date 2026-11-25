@@ -68,6 +68,7 @@ from .record_storage import (
     iter_dedicated_payloads,
     page_dedicated_records,
     sample_dedicated_records,
+    scope_record_key,
 )
 from .schemas import (
     DatabaseCatalogRequest,
@@ -587,11 +588,21 @@ def update_dataset(
             if str(item).strip()
         ]
         if dataset.upsert_keys:
+            database_source_ids = set(
+                db.scalars(
+                    select(DataSource.id).where(
+                        DataSource.source_type.in_(
+                            {"mysql", "postgres", "postgresql"}
+                        )
+                    )
+                ).all()
+            )
             if dataset.physical_table:
                 backfill_dedicated_record_keys(
                     db.get_bind(),
                     dataset.physical_table,
                     dataset.upsert_keys,
+                    scoped_source_ids=database_source_ids,
                 )
             else:
                 for record in db.scalars(
@@ -603,6 +614,14 @@ def update_dataset(
                         dataset.upsert_keys,
                         record.payload or {},
                     )
+                    if (
+                        record.record_key
+                        and record.source_id in database_source_ids
+                    ):
+                        record.record_key = scope_record_key(
+                            record.record_key,
+                            record.source_object,
+                        )
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -1218,12 +1237,15 @@ def create_source(
     payload: DataSourceCreate,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填写数据源名称")
     try:
         validate_source_config(payload.source_type, payload.config)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     source = DataSource(
-        name=payload.name,
+        name=name,
         source_type=payload.source_type,
         config=prepare_source_config(payload.config),
         status="ready" if payload.source_type == "upload" else "configured",
@@ -1249,13 +1271,18 @@ def update_source(
         if not name:
             raise HTTPException(status_code=400, detail="数据源名称不能为空")
         source.name = name
-    if "source_type" in values and values["source_type"] is not None:
-        source.source_type = str(values["source_type"])
+    target_source_type = str(values.get("source_type") or source.source_type)
+    target_config = (
+        values["config"]
+        if "config" in values and values["config"] is not None
+        else source.config
+    )
+    try:
+        validate_source_config(target_source_type, target_config)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    source.source_type = target_source_type
     if "config" in values and values["config"] is not None:
-        try:
-            validate_source_config(source.source_type, values["config"])
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
         source.config = prepare_source_config_update(
             source.config or {},
             values["config"],

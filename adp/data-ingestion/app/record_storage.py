@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 
 from sqlalchemy import and_, inspect, or_, select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -42,6 +43,14 @@ def business_record_key(keys: list[str], payload: dict[str, Any]) -> str:
         default=str,
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def scope_record_key(record_key: str, scope: str) -> str:
+    if not record_key or not scope:
+        return record_key
+    return hashlib.sha256(
+        f"{scope}:{record_key}".encode("utf-8")
+    ).hexdigest()
 
 
 def _chunks(values: list[_T], size: int = _LOOKUP_CHUNK_SIZE) -> Iterator[list[_T]]:
@@ -87,6 +96,12 @@ def _insert_shared_ignore(
         rows = [{**record, "dataset_id": dataset_id} for record in chunk]
         if dialect == "sqlite":
             statement = sqlite_insert(table).values(rows).on_conflict_do_nothing(
+                index_elements=["dataset_id", "fingerprint"]
+            )
+        elif dialect == "postgresql":
+            statement = postgresql_insert(table).values(
+                rows
+            ).on_conflict_do_nothing(
                 index_elements=["dataset_id", "fingerprint"]
             )
         elif dialect in {"mysql", "mariadb"}:
@@ -215,10 +230,10 @@ def dedicated_table_name(dataset: Dataset) -> str:
     return dataset.physical_table or f"di_records_{dataset.id}"
 
 
-def _quote_table(name: str) -> str:
+def _quote_table(name: str, engine: Engine) -> str:
     if not _TABLE_NAME.fullmatch(name):
         raise ValueError("invalid dedicated record table name")
-    return f"`{name}`"
+    return engine.dialect.identifier_preparer.quote(name)
 
 
 def _partition_name(value: datetime) -> str:
@@ -252,9 +267,12 @@ def ensure_dataset_table(
     at: datetime | None = None,
 ) -> str:
     table_name = dedicated_table_name(dataset)
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     dialect = engine.dialect.name
-    payload_type = "JSON" if dialect in {"mysql", "mariadb"} else "TEXT"
+    payload_type = (
+        "JSON" if dialect in {"mysql", "mariadb", "postgresql"} else "TEXT"
+    )
+    timestamp_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME(6)"
     partition_sql = ""
     if dialect in {"mysql", "mariadb"}:
         partition_sql = (
@@ -275,7 +293,7 @@ def ensure_dataset_table(
         f"source_locator {payload_type} NULL, "
         "row_index BIGINT NOT NULL DEFAULT 0, "
         f"payload {payload_type} NOT NULL, "
-        "created_at DATETIME(6) NOT NULL, "
+        f"created_at {timestamp_type} NOT NULL, "
         "PRIMARY KEY (id, created_at), "
         "UNIQUE (run_id, fingerprint, created_at)"
         ")"
@@ -315,7 +333,7 @@ def ensure_month_partition(
 ) -> None:
     if engine.dialect.name not in {"mysql", "mariadb"}:
         return
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     partition = _partition_name(value)
     with engine.begin() as connection:
         exists = connection.scalar(
@@ -402,7 +420,14 @@ def prepare_dataset_storage(
     at: datetime | None = None,
 ) -> str:
     if dataset.storage_mode == "dedicated":
-        return ensure_dataset_table(db.get_bind(), dataset, at=at)
+        table_name = ensure_dataset_table(db.get_bind(), dataset, at=at)
+        dataset.physical_table = table_name
+        dataset.partition_mode = (
+            "month"
+            if db.get_bind().dialect.name in {"mysql", "mariadb"}
+            else ""
+        )
+        return table_name
     if (
         dataset.storage_mode == "auto"
         and dataset.record_count + incoming_count >= DEDICATED_RECORD_THRESHOLD
@@ -419,7 +444,7 @@ def insert_dedicated_records(
     if not records:
         return 0
     ensure_month_partition(engine, table_name, records[0]["created_at"])
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     unique_records: list[dict[str, Any]] = []
     batch_fingerprints: set[str] = set()
     for record in records:
@@ -470,10 +495,26 @@ def insert_dedicated_records(
             }
             for record in unique_records
         ]
+        dialect = engine.dialect.name
         insert_sql = (
             "INSERT OR IGNORE"
-            if engine.dialect.name == "sqlite"
+            if dialect == "sqlite"
+            else "INSERT"
+            if dialect == "postgresql"
             else "INSERT IGNORE"
+        )
+        conflict_sql = (
+            " ON CONFLICT DO NOTHING" if dialect == "postgresql" else ""
+        )
+        source_locator_bind = (
+            "CAST(:source_locator AS JSON)"
+            if dialect == "postgresql"
+            else ":source_locator"
+        )
+        payload_bind = (
+            "CAST(:payload AS JSON)"
+            if dialect == "postgresql"
+            else ":payload"
         )
         connection.execute(
             text(
@@ -481,7 +522,8 @@ def insert_dedicated_records(
                 "(id, run_id, fingerprint, record_key, data_type, asset_path, "
                 "source_id, source_object, source_locator, row_index, payload, created_at) "
                 "VALUES (:id, :run_id, :fingerprint, :record_key, :data_type, :asset_path, "
-                ":source_id, :source_object, :source_locator, :row_index, :payload, :created_at)"
+                f":source_id, :source_object, {source_locator_bind}, :row_index, "
+                f"{payload_bind}, :created_at){conflict_sql}"
             ),
             rows,
         )
@@ -496,7 +538,7 @@ def upsert_dedicated_records(
     if not records:
         return 0, 0, 0
     ensure_month_partition(engine, table_name, records[0]["created_at"])
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     inserted = 0
     updated = 0
     duplicates = 0
@@ -615,22 +657,50 @@ def upsert_dedicated_records(
             inserted += 1
 
         if update_rows:
+            dialect = engine.dialect.name
+            source_locator_bind = (
+                "CAST(:source_locator AS JSON)"
+                if dialect == "postgresql"
+                else ":source_locator"
+            )
+            payload_bind = (
+                "CAST(:payload AS JSON)"
+                if dialect == "postgresql"
+                else ":payload"
+            )
             connection.execute(
                 text(
                     f"UPDATE {quoted} SET run_id = :run_id, "
                     "fingerprint = :fingerprint, data_type = :data_type, "
                     "asset_path = :asset_path, source_id = :source_id, "
                     "source_object = :source_object, "
-                    "source_locator = :source_locator, row_index = :row_index, "
-                    "payload = :payload WHERE id = :id"
+                    f"source_locator = {source_locator_bind}, "
+                    f"row_index = :row_index, payload = {payload_bind} "
+                    "WHERE id = :id"
                 ),
                 update_rows,
             )
         if pending:
+            dialect = engine.dialect.name
             insert_sql = (
                 "INSERT OR IGNORE"
-                if engine.dialect.name == "sqlite"
+                if dialect == "sqlite"
+                else "INSERT"
+                if dialect == "postgresql"
                 else "INSERT IGNORE"
+            )
+            conflict_sql = (
+                " ON CONFLICT DO NOTHING" if dialect == "postgresql" else ""
+            )
+            source_locator_bind = (
+                "CAST(:source_locator AS JSON)"
+                if dialect == "postgresql"
+                else ":source_locator"
+            )
+            payload_bind = (
+                "CAST(:payload AS JSON)"
+                if dialect == "postgresql"
+                else ":payload"
             )
             connection.execute(
                 text(
@@ -639,8 +709,8 @@ def upsert_dedicated_records(
                     "source_id, source_object, source_locator, "
                     "row_index, payload, created_at) VALUES "
                     "(:id, :run_id, :fingerprint, :record_key, :data_type, "
-                    ":asset_path, :source_id, :source_object, :source_locator, "
-                    ":row_index, :payload, :created_at)"
+                    f":asset_path, :source_id, :source_object, {source_locator_bind}, "
+                    f":row_index, {payload_bind}, :created_at){conflict_sql}"
                 ),
                 [
                     {
@@ -668,14 +738,18 @@ def backfill_dedicated_record_keys(
     engine: Engine,
     table_name: str,
     keys: list[str],
+    *,
+    scoped_source_ids: set[str] | None = None,
 ) -> int:
     if not keys:
         return 0
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     changed = 0
     with engine.begin() as connection:
         rows = connection.execute(
-            text(f"SELECT id, payload FROM {quoted}")
+            text(
+                f"SELECT id, source_id, source_object, payload FROM {quoted}"
+            )
         ).mappings().all()
         for row in rows:
             payload = (
@@ -686,6 +760,12 @@ def backfill_dedicated_record_keys(
             record_key = business_record_key(keys, payload)
             if not record_key:
                 continue
+            source_id = str(row.get("source_id") or "")
+            if scoped_source_ids and source_id in scoped_source_ids:
+                record_key = scope_record_key(
+                    record_key,
+                    str(row.get("source_object") or ""),
+                )
             connection.execute(
                 text(
                     f"UPDATE {quoted} SET record_key = :record_key "
@@ -701,7 +781,9 @@ def count_dedicated_records(engine: Engine, table_name: str) -> int:
     with engine.connect() as connection:
         return int(
             connection.scalar(
-                text(f"SELECT COUNT(*) FROM {_quote_table(table_name)}")
+                text(
+                    f"SELECT COUNT(*) FROM {_quote_table(table_name, engine)}"
+                )
             )
             or 0
         )
@@ -718,7 +800,7 @@ def sample_dedicated_records(
             text(
                 f"SELECT id, run_id, fingerprint, record_key, data_type, asset_path, "
                 f"source_id, source_object, source_locator, payload, created_at "
-                f"FROM {_quote_table(table_name)} "
+                f"FROM {_quote_table(table_name, engine)} "
                 "ORDER BY created_at DESC, id DESC LIMIT :limit"
             ),
             {"limit": limit},
@@ -749,7 +831,7 @@ def iter_dedicated_payloads(
             stream_results=True
         ).execute(
             text(
-                f"SELECT payload FROM {_quote_table(table_name)} "
+                f"SELECT payload FROM {_quote_table(table_name, engine)} "
                 "ORDER BY created_at ASC, id ASC"
             )
         )
@@ -770,7 +852,7 @@ def backfill_dedicated_provenance(
     table_name: str,
     run_metadata: dict[str, dict[str, Any]],
 ) -> int:
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     changed = 0
     with engine.begin() as connection:
         rows = connection.execute(
@@ -832,9 +914,14 @@ def page_dedicated_records(
     where = ""
     params: dict[str, Any] = {}
     if query.strip():
-        where = " WHERE LOWER(CAST(payload AS CHAR)) LIKE :query "
+        payload_text_type = (
+            "TEXT" if engine.dialect.name == "postgresql" else "CHAR"
+        )
+        where = (
+            f" WHERE LOWER(CAST(payload AS {payload_text_type})) LIKE :query "
+        )
         params["query"] = f"%{query.strip().lower()}%"
-    quoted = _quote_table(table_name)
+    quoted = _quote_table(table_name, engine)
     with engine.connect() as connection:
         total = int(
             connection.scalar(
@@ -875,8 +962,90 @@ def page_dedicated_records(
 def delete_dedicated_run(engine: Engine, table_name: str, run_id: str) -> None:
     with engine.begin() as connection:
         connection.execute(
-            text(f"DELETE FROM {_quote_table(table_name)} WHERE run_id = :run_id"),
+            text(
+                f"DELETE FROM {_quote_table(table_name, engine)} "
+                "WHERE run_id = :run_id"
+            ),
             {"run_id": run_id},
+        )
+
+
+def delete_dedicated_source_records(
+    engine: Engine,
+    table_name: str,
+    *,
+    source_id: str,
+    source_object: str,
+    keep_fingerprints: set[str] | None = None,
+) -> None:
+    with engine.begin() as connection:
+        quoted = _quote_table(table_name, engine)
+        rows = connection.execute(
+            text(
+                f"SELECT id, fingerprint FROM {quoted} "
+                "WHERE source_id = :source_id "
+                "AND source_object = :source_object"
+            ),
+            {
+                "source_id": source_id,
+                "source_object": source_object,
+            },
+        ).mappings()
+        stale_ids = [
+            str(row["id"])
+            for row in rows
+            if keep_fingerprints is None
+            or str(row["fingerprint"]) not in keep_fingerprints
+        ]
+        for chunk in _chunks(stale_ids):
+            placeholders = ", ".join(
+                f":record_id_{index}" for index in range(len(chunk))
+            )
+            connection.execute(
+                text(f"DELETE FROM {quoted} WHERE id IN ({placeholders})"),
+                {
+                    f"record_id_{index}": record_id
+                    for index, record_id in enumerate(chunk)
+                },
+            )
+
+
+def prune_dedicated_source_records(
+    engine: Engine,
+    table_name: str,
+    *,
+    source_id: str,
+    active_source_objects: set[str],
+) -> None:
+    with engine.begin() as connection:
+        if not active_source_objects:
+            connection.execute(
+                text(
+                    f"DELETE FROM {_quote_table(table_name, engine)} "
+                    "WHERE source_id = :source_id"
+                ),
+                {"source_id": source_id},
+            )
+            return
+        placeholders = ", ".join(
+            f":source_object_{index}"
+            for index in range(len(active_source_objects))
+        )
+        connection.execute(
+            text(
+                f"DELETE FROM {_quote_table(table_name, engine)} "
+                "WHERE source_id = :source_id "
+                f"AND source_object NOT IN ({placeholders})"
+            ),
+            {
+                "source_id": source_id,
+                **{
+                    f"source_object_{index}": value
+                    for index, value in enumerate(
+                        sorted(active_source_objects)
+                    )
+                },
+            },
         )
 
 
@@ -884,4 +1053,8 @@ def drop_dedicated_table(engine: Engine, table_name: str) -> None:
     if not table_name:
         return
     with engine.begin() as connection:
-        connection.execute(text(f"DROP TABLE IF EXISTS {_quote_table(table_name)}"))
+        connection.execute(
+            text(
+                f"DROP TABLE IF EXISTS {_quote_table(table_name, engine)}"
+            )
+        )

@@ -36,6 +36,7 @@ from .record_storage import (
     lock_dataset_for_write,
     persist_shared_records,
     prepare_dataset_storage,
+    scope_record_key,
     upsert_dedicated_records,
 )
 from .seed import TEMPLATES
@@ -57,9 +58,18 @@ def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def payload_fingerprint(data_type: str, payload: dict[str, Any]) -> str:
+def payload_fingerprint(
+    data_type: str,
+    payload: dict[str, Any],
+    *,
+    source_object: str = "",
+) -> str:
     canonical = json.dumps(
-        {"data_type": data_type, "payload": payload},
+        {
+            "data_type": data_type,
+            "payload": payload,
+            "source_object": source_object,
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -395,13 +405,17 @@ def _run_configured_pipeline(
     return inserted, updated, duplicates
 
 
-def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
+def run_pipeline(
+    run_id: str,
+    space_id: str = DEFAULT_SPACE_ID,
+) -> set[str] | None:
     db = session_for_space(space_id)
     active_stage: StageRun | None = None
+    snapshot_fingerprints: set[str] | None = None
     try:
         run = db.get(IngestionRun, run_id)
         if run is None:
-            return
+            return None
         run.status = "running"
         run.started_at = utc_now()
         db.commit()
@@ -476,7 +490,7 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
             run.status = "success"
             run.finished_at = utc_now()
             db.commit()
-            return
+            return None
 
         active_stage = stages.get("receive")
         if active_stage:
@@ -643,11 +657,18 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
         updated = 0
         duplicates = 0
         payloads: list[dict[str, Any]] = []
+        fingerprint_scope = str(
+            (run.source_context or {}).get("dedupe_scope") or ""
+        )
         if normalized_rows:
             payloads = [
                 {
                     "data_type": "row",
-                    "fingerprint": payload_fingerprint("row", row),
+                    "fingerprint": payload_fingerprint(
+                        "row",
+                        row,
+                        source_object=fingerprint_scope,
+                    ),
                     "payload": row,
                 }
                 for row in normalized_rows
@@ -659,6 +680,7 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                     "fingerprint": payload_fingerprint(
                         "document" if normalized_text else file_type,
                         {"sha256": run.fingerprint},
+                        source_object=fingerprint_scope,
                     ),
                     "payload": {
                         "filename": run.original_name,
@@ -670,6 +692,9 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                     },
                 }
             ]
+        snapshot_fingerprints = {
+            str(item["fingerprint"]) for item in payloads
+        }
         if active_stage:
             set_stage(
                 db,
@@ -685,15 +710,21 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
         upsert_keys = list(dataset.upsert_keys or []) if dataset is not None else []
         if upsert_keys:
             for item in payloads:
-                item["record_key"] = business_record_key(
+                record_key = business_record_key(
                     upsert_keys,
                     item["payload"],
                 )
-                if not item["record_key"]:
+                if not record_key:
                     raise ValueError(
                         "配置的业务主键字段在数据中不存在或为空："
                         + ", ".join(upsert_keys)
                     )
+                if fingerprint_scope:
+                    record_key = scope_record_key(
+                        record_key,
+                        fingerprint_scope,
+                    )
+                item["record_key"] = record_key
         dedicated_table = (
             prepare_dataset_storage(
                 db,
@@ -864,6 +895,7 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
         run.finished_at = utc_now()
         run.error_count = 0
         db.commit()
+        return snapshot_fingerprints
     except Exception as error:
         logger.exception("Ingestion run failed: %s", run_id)
         db.rollback()
@@ -886,3 +918,4 @@ def run_pipeline(run_id: str, space_id: str = DEFAULT_SPACE_ID) -> None:
                 )
     finally:
         db.close()
+    return None
