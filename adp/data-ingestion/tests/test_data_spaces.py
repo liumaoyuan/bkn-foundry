@@ -7,10 +7,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 from fastapi import HTTPException, Request
 
+import app.database as database_module
 from app.database import (
     SessionLocal,
     get_db,
@@ -120,9 +122,22 @@ class DataSpaceRoutingTest(unittest.TestCase):
         for database_url in (
             "mysql+pymysql://user:password@mysql.example.com:3306/data_space",
             "mariadb+pymysql://user:password@mariadb.example.com:3306/data_space",
+            "postgresql+psycopg://user:password@postgres.example.com:5432/data_space",
         ):
             with self.subTest(database_url=database_url):
                 self.assertEqual(validate_database_url(database_url), database_url)
+
+    def test_runtime_rejects_sqlite_control_database(self) -> None:
+        with mock.patch.object(database_module, "APP_ENV", "development"):
+            with mock.patch.object(
+                database_module,
+                "ALLOW_SQLITE_DATABASE",
+                False,
+            ):
+                with self.assertRaisesRegex(ValueError, "SQLite"):
+                    validate_database_url(
+                        "sqlite+pysqlite:////tmp/control.db"
+                    )
 
 
 if __name__ == "__main__":

@@ -24,13 +24,17 @@ S3_FORCE_PATH_STYLE = os.getenv("S3_FORCE_PATH_STYLE", "true").lower() in {
     "true",
     "yes",
 }
-DATABASE_PATH = DATA_DIR / "app.db"
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 ENV_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DEFAULT_DATABASE_URL = f"sqlite+pysqlite:///{DATABASE_PATH.as_posix()}"
-DATABASE_URL = ENV_DATABASE_URL or (
-    DEFAULT_DATABASE_URL if APP_ENV != "production" else ""
-)
+DATABASE_URL = ENV_DATABASE_URL
+ALLOW_SQLITE_DATABASE = os.getenv(
+    "ALLOW_SQLITE_DATABASE",
+    "false",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 CONTROL_DATABASE_CONFIG_PATH = Path(
     os.getenv(
         "CONTROL_DATABASE_CONFIG_PATH",
@@ -46,9 +50,11 @@ CONTROL_DATABASE_BOOTSTRAP_ENABLED = os.getenv(
     "yes",
 }
 
-if APP_ENV == "production" and ENV_DATABASE_URL.startswith("sqlite"):
+if APP_ENV == "production" and (
+    ENV_DATABASE_URL.startswith("sqlite") or ALLOW_SQLITE_DATABASE
+):
     raise RuntimeError(
-        "生产环境不允许使用 SQLite。请配置 MySQL/MariaDB 控制库，"
+        "生产环境不允许使用 SQLite。请配置 MySQL/MariaDB/PostgreSQL 控制库，"
         "或启用前端控制库初始化。"
     )
 

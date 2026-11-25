@@ -39,7 +39,11 @@ spec:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.passwordKey }}
             - name: DATABASE_URL
+              {{- if .Values.database.url }}
+              value: {{ .Values.database.url | quote }}
+              {{- else }}
               value: "mysql+pymysql://{{ .Values.database.user }}:$(DB_PASSWORD)@{{ .Values.database.host }}:{{ .Values.database.port }}/{{ .Values.database.name }}?charset=utf8mb4"
+              {{- end }}
             - name: DATA_DIR
               value: /data
             - name: STORAGE_BACKEND

@@ -31,6 +31,7 @@ class ControlDatabaseAlreadyInitialized(ControlDatabaseBootstrapError):
 
 _bootstrap_lock = threading.Lock()
 _DATABASE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+_ADMIN_DATABASE = {"postgresql": "postgres"}
 
 
 def _database_details(database_url: str):
@@ -42,13 +43,45 @@ def _database_details(database_url: str):
     database_name = (parsed.database or "").strip()
     if not database_name:
         raise ControlDatabaseBootstrapError("数据库连接地址必须包含目标数据库名")
-    if parsed.get_backend_name() in {"mysql", "mariadb"} and not (
+    if parsed.get_backend_name() in {"mysql", "mariadb", "postgresql"} and not (
         _DATABASE_NAME_PATTERN.fullmatch(database_name)
     ):
         raise ControlDatabaseBootstrapError(
             "数据库名只能包含字母、数字和下划线"
         )
     return value, parsed, database_name
+
+
+def _server_connection_url(
+    parsed,
+    *,
+    backend: str,
+    bootstrap_database_url: str = "",
+):
+    if bootstrap_database_url.strip():
+        _, bootstrap, _ = _database_details(bootstrap_database_url)
+        server = bootstrap
+    else:
+        server = parsed
+    if backend == "postgresql":
+        if not bootstrap_database_url.strip():
+            return server.set(database=_ADMIN_DATABASE[backend])
+        return server.set(database=server.database or _ADMIN_DATABASE[backend])
+    return server.set(database=None)
+
+
+def _database_exists(connection, *, backend: str, database_name: str) -> bool:
+    if backend == "postgresql":
+        exists = connection.scalar(
+            text("SELECT 1 FROM pg_database WHERE datname = :database"),
+            {"database": database_name},
+        )
+    else:
+        exists = connection.scalar(
+            text("SHOW DATABASES LIKE :database"),
+            {"database": database_name},
+        )
+    return exists is not None
 
 
 def test_control_database(database_url: str) -> dict[str, str | bool]:
@@ -70,7 +103,7 @@ def test_control_database(database_url: str) -> dict[str, str | bool]:
             "database_label": database_label(value),
         }
 
-    server_url = parsed.set(database=None)
+    server_url = _server_connection_url(parsed, backend=backend)
     probe_engine = create_engine(
         server_url,
         pool_pre_ping=True,
@@ -79,15 +112,16 @@ def test_control_database(database_url: str) -> dict[str, str | bool]:
     try:
         with probe_engine.connect() as connection:
             connection.execute(text("SELECT 1"))
-            exists = connection.scalar(
-                text("SHOW DATABASES LIKE :database"),
-                {"database": database_name},
+            exists = _database_exists(
+                connection,
+                backend=backend,
+                database_name=database_name,
             )
     finally:
         probe_engine.dispose()
     return {
         "connected": True,
-        "database_exists": exists is not None,
+        "database_exists": exists,
         "database_name": database_name,
         "database_label": database_label(value),
     }
@@ -109,12 +143,11 @@ def _ensure_database_exists(
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         return
 
-    setup_value = (
-        _database_details(bootstrap_database_url)[0]
-        if bootstrap_database_url.strip()
-        else database_url
+    setup_url = _server_connection_url(
+        parsed,
+        backend=backend,
+        bootstrap_database_url=bootstrap_database_url,
     )
-    setup_url = make_url(setup_value).set(database=None)
     setup_engine = create_engine(
         setup_url,
         pool_pre_ping=True,
@@ -124,22 +157,29 @@ def _ensure_database_exists(
         with setup_engine.connect().execution_options(
             isolation_level="AUTOCOMMIT"
         ) as connection:
-            exists = connection.scalar(
-                text("SHOW DATABASES LIKE :database"),
-                {"database": database_name},
+            exists = _database_exists(
+                connection,
+                backend=backend,
+                database_name=database_name,
             )
-            if exists is not None:
+            if exists:
                 return
             if not create_database:
                 raise ControlDatabaseBootstrapError(
                     f"目标数据库 {database_name} 不存在"
                 )
-            connection.execute(
-                text(
-                    f"CREATE DATABASE `{database_name}` "
-                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                )
+            quoted_name = connection.dialect.identifier_preparer.quote(
+                database_name
             )
+            if backend == "postgresql":
+                connection.execute(text(f"CREATE DATABASE {quoted_name}"))
+            else:
+                connection.execute(
+                    text(
+                        f"CREATE DATABASE {quoted_name} "
+                        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                    )
+                )
     finally:
         setup_engine.dispose()
 

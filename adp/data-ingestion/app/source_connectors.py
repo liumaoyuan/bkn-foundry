@@ -62,7 +62,23 @@ def database_url(source_type: str, config: dict[str, Any]) -> str:
 
 
 def database_query_mode(config: dict[str, Any]) -> str:
-    return "table" if str(config.get("query_mode") or "").strip() == "table" else "custom"
+    return "table"
+
+
+def configured_table_names(config: dict[str, Any]) -> list[str]:
+    values = config.get("table_names")
+    if isinstance(values, list):
+        names = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in values
+                if isinstance(value, str) and value.strip()
+            )
+        )
+        if names:
+            return names
+    table_name = str(config.get("table_name") or "").strip()
+    return [table_name] if table_name else []
 
 
 def _column_type_name(column: dict[str, Any]) -> str:
@@ -189,10 +205,10 @@ def inspect_database_catalog(
 
 
 def database_source_query(engine: Engine, config: dict[str, Any]) -> str:
-    if database_query_mode(config) != "table":
-        return str(config.get("query") or "").strip()
-
+    table_names = configured_table_names(config)
     table_name = str(config.get("table_name") or "").strip()
+    if not table_name and len(table_names) == 1:
+        table_name = table_names[0]
     if not table_name:
         raise ValueError("请选择要同步的数据库表")
     inspector = sqlalchemy_inspect(engine)
@@ -212,19 +228,9 @@ def database_source_query(engine: Engine, config: dict[str, Any]) -> str:
         else quote(table_name)
     )
     query = f"SELECT * FROM {qualified_table}"
-    sync_mode = str(config.get("sync_mode") or "full")
-    if sync_mode != "incremental":
-        return query
-    watermark_column = str(config.get("watermark_column") or "").strip()
-    if not watermark_column:
-        raise ValueError("增量同步需要选择判断数据变化的字段")
-    if watermark_column not in columns:
-        raise ValueError(f"表中不存在字段：{watermark_column}")
-    quoted_watermark = quote(watermark_column)
-    return (
-        f"{query} WHERE {quoted_watermark} >= :cursor "
-        f"ORDER BY {quoted_watermark} ASC"
-    )
+    # Database sources are synchronized as complete snapshots. Keeping this
+    # query free of cursor predicates lets stale configurations run consistently.
+    return query
 
 
 def _path_value(value: Any, path: str) -> Any:
@@ -258,16 +264,32 @@ def _tabular_records(value: Any) -> list[dict[str, Any]]:
 
 def _cell_value(value: Any) -> Any:
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, default=str)
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+        )
     return value
 
 
 def records_to_csv(records: list[dict[str, Any]]) -> bytes:
-    columns: list[str] = []
-    for record in records:
-        for key in record:
-            if key not in columns:
-                columns.append(str(key))
+    records = sorted(
+        records,
+        key=lambda record: json.dumps(
+            record,
+            sort_keys=True,
+            default=str,
+            ensure_ascii=False,
+        ),
+    )
+    columns = sorted(
+        {
+            str(key)
+            for record in records
+            for key in record
+        }
+    )
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=columns)
     writer.writeheader()
@@ -335,7 +357,7 @@ def request_api_source(
                 rows = list(csv.DictReader(io.StringIO(response.text)))
                 return (
                     f"{Path(source_name).stem or 'api'}_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.csv",
-                    response.text.encode("utf-8-sig"),
+                    records_to_csv(rows),
                     len(rows),
                 )
             if "text" in content_type:
@@ -438,17 +460,24 @@ def _test_database(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     engine = create_engine(database_url(source_type, config), pool_pre_ping=True)
-    query = database_source_query(engine, config)
     try:
         with engine.connect() as connection:
-            if query:
-                params = {}
-                if ":cursor" in query:
-                    params["cursor"] = str(config.get("initial_cursor") or "1970-01-01T00:00:00")
-                result = connection.execute(text(query), params)
-                row = result.fetchone()
-                return {"connected": True, "sample_available": row is not None}
-            connection.execute(text("SELECT 1"))
+            table_names = configured_table_names(config)
+            if table_names:
+                available = False
+                for table_name in table_names:
+                    query = database_source_query(
+                        engine,
+                        {**config, "table_name": table_name},
+                    )
+                    if connection.execute(text(query)).fetchone() is not None:
+                        available = True
+                return {
+                    "connected": True,
+                    "sample_available": available,
+                    "tables": table_names,
+                }
+            raise ValueError("数据库数据源必须选择数据表")
     finally:
         engine.dispose()
     return {"connected": True, "sample_available": False}

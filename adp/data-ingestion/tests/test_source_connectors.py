@@ -22,6 +22,7 @@ from app.auto_scan_api import validate_scan_requirements, validate_scan_type
 from app.models import Base, DataSource
 from app.source_connectors import (
     _database_catalog_data,
+    configured_table_names,
     database_source_query,
     request_api_source,
 )
@@ -80,6 +81,37 @@ class SourceConnectorTest(unittest.TestCase):
         self.assertEqual(count, 3)
         self.assertIn("id\r\n1\r\n2\r\n3", content.decode("utf-8-sig"))
 
+    def test_api_row_order_does_not_change_snapshot_bytes(self) -> None:
+        responses = [
+            [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}],
+            [{"name": "beta", "id": 2}, {"name": "alpha", "id": 1}],
+        ]
+
+        def request(_method: str, _url: str, **_kwargs):
+            payload = responses.pop(0)
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", _url),
+                headers={"content-type": "application/json"},
+                json={"data": payload},
+            )
+
+        with patch("app.source_connectors.httpx.request", side_effect=request):
+            _, first, _ = request_api_source(
+                {
+                    "url": "https://api.example.test/items",
+                    "record_path": "data",
+                }
+            )
+            _, second, _ = request_api_source(
+                {
+                    "url": "https://api.example.test/items",
+                    "record_path": "data",
+                }
+            )
+
+        self.assertEqual(first, second)
+
     def test_update_keeps_existing_encrypted_password_when_blank(self) -> None:
         current = {"password_encrypted": "encrypted-value", "query": "select 1"}
         updated = prepare_source_config_update(
@@ -108,7 +140,27 @@ class SourceConnectorTest(unittest.TestCase):
         source = DataSource(name="API", source_type="api", config={})
         validate_scan_type(source, "api")
 
-    def test_database_catalog_recommends_updated_at_and_builds_query(self) -> None:
+    def test_all_supported_source_types_map_to_auto_scan(self) -> None:
+        accepted = {
+            "upload": "local",
+            "local_dir": "local",
+            "ftp": "ftp",
+            "sftp": "sftp",
+            "mysql": "database",
+            "postgres": "database",
+            "postgresql": "database",
+            "api": "api",
+        }
+        for source_type, scan_type in accepted.items():
+            with self.subTest(source_type=source_type):
+                source = DataSource(
+                    name=source_type,
+                    source_type=source_type,
+                    config={},
+                )
+                validate_scan_type(source, scan_type)
+
+    def test_database_catalog_builds_full_snapshot_query(self) -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
         with engine.begin() as connection:
             connection.execute(
@@ -133,8 +185,8 @@ class SourceConnectorTest(unittest.TestCase):
             },
         )
         self.assertIn("FROM orders", query)
-        self.assertIn("updated_at >= :cursor", query)
-        self.assertTrue(query.endswith("ORDER BY updated_at ASC"))
+        self.assertNotIn(":cursor", query)
+        self.assertNotIn("WHERE", query)
         engine.dispose()
 
     def test_table_mode_source_is_valid_without_manual_sql(self) -> None:
@@ -150,20 +202,37 @@ class SourceConnectorTest(unittest.TestCase):
         )
         validate_scan_requirements(source, "database", "")
 
-    def test_table_mode_requires_a_table_and_incremental_field(self) -> None:
+    def test_multiple_table_configuration_is_supported(self) -> None:
+        config = {
+            "query_mode": "table",
+            "table_names": ["customers", "orders", "customers"],
+        }
+        validate_source_config("mysql", config)
+        self.assertEqual(
+            configured_table_names(config),
+            ["customers", "orders"],
+        )
+
+    def test_unsupported_source_and_custom_sql_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不支持的数据源类型"):
+            validate_source_config("unknown", {})
+        with self.assertRaisesRegex(ValueError, "本地目录"):
+            validate_source_config("local_dir", {})
+        with self.assertRaisesRegex(ValueError, "主机地址"):
+            validate_source_config("ftp", {})
+        with self.assertRaisesRegex(ValueError, "接口地址"):
+            validate_source_config("api", {})
+        with self.assertRaisesRegex(ValueError, "必须选择数据表"):
+            validate_source_config(
+                "mysql",
+                {"query_mode": "custom", "query": "SELECT 1"},
+            )
+
+    def test_table_mode_requires_a_table(self) -> None:
         with self.assertRaisesRegex(ValueError, "请选择需要同步的数据表"):
             validate_source_config(
                 "mysql",
                 {"query_mode": "table", "sync_mode": "full"},
-            )
-        with self.assertRaisesRegex(ValueError, "需要选择判断数据变化的字段"):
-            validate_source_config(
-                "mysql",
-                {
-                    "query_mode": "table",
-                    "table_name": "orders",
-                    "sync_mode": "incremental",
-                },
             )
 
     def test_startup_migration_encrypts_existing_plain_headers(self) -> None:

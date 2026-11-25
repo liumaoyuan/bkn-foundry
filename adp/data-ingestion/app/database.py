@@ -17,6 +17,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import (
+    ALLOW_SQLITE_DATABASE,
     APP_ENV,
     CONTROL_DATABASE_CONFIG_PATH,
     DATABASE_URL,
@@ -30,7 +31,12 @@ DEFAULT_SPACE_ID = "default"
 ALLOWED_DATABASE_SCHEMES = {
     "mysql",
     "mariadb",
-    "sqlite",
+    "postgresql",
+}
+SUPPORTED_DATABASE_DRIVERS = {
+    "mysql": {"mysql+pymysql"},
+    "mariadb": {"mariadb+pymysql"},
+    "postgresql": {"postgresql+psycopg"},
 }
 
 
@@ -303,15 +309,16 @@ def validate_database_url(database_url: str) -> str:
         parsed = make_url(value)
     except ArgumentError as error:
         raise ValueError("数据库连接地址格式无效") from error
-    if parsed.get_backend_name() not in ALLOWED_DATABASE_SCHEMES:
-        raise ValueError("仅支持 MySQL/MariaDB 或本地开发用 SQLite")
-    if parsed.get_backend_name() in {"mysql", "mariadb"} and parsed.drivername not in {
-        "mysql+pymysql",
-        "mariadb+pymysql",
-    }:
-        raise ValueError("MySQL/MariaDB 必须使用 mysql+pymysql 或 mariadb+pymysql 驱动")
-    if APP_ENV == "production" and parsed.get_backend_name() == "sqlite":
-        raise ValueError("生产环境的数据空间只支持 MySQL/MariaDB")
+    backend = parsed.get_backend_name()
+    if backend == "sqlite":
+        if APP_ENV == "test" and ALLOW_SQLITE_DATABASE:
+            return value
+        raise ValueError("SQLite 仅用于内部测试，运行环境不支持 SQLite")
+    if backend not in ALLOWED_DATABASE_SCHEMES:
+        raise ValueError("仅支持 MySQL、MariaDB 或 PostgreSQL")
+    if parsed.drivername not in SUPPORTED_DATABASE_DRIVERS[backend]:
+        expected = "、".join(sorted(SUPPORTED_DATABASE_DRIVERS[backend]))
+        raise ValueError(f"{backend} 必须使用 {expected} 驱动")
     return value
 
 

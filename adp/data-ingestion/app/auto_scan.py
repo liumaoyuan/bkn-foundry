@@ -5,6 +5,7 @@ import csv
 import fnmatch
 import hashlib
 import io
+import json
 import logging
 import posixpath
 import stat
@@ -17,7 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from sqlalchemy import create_engine, or_, select, text
+from sqlalchemy import create_engine, func, or_, select, text
 
 from .config import (
     AUTO_SCAN_ENABLED,
@@ -33,10 +34,22 @@ from .database import (
 from .data_source_service import resolved_source_config
 from .file_inspector import inspect_file
 from .ingestion_service import IngestionValidationError, create_ingestion_run
-from .models import AutoScanJob, DataSource, IngestionRun, utc_now
+from .models import (
+    AutoScanJob,
+    DataSource,
+    Dataset,
+    DatasetRecord,
+    IngestionRun,
+    utc_now,
+)
 from .pipeline import run_pipeline
+from .record_storage import (
+    count_dedicated_records,
+    delete_dedicated_source_records,
+    prune_dedicated_source_records,
+)
 from .source_connectors import (
-    database_query_mode,
+    configured_table_names,
     database_source_query,
     database_url,
     load_sftp_private_key,
@@ -208,21 +221,47 @@ class AutoScanScheduler:
         self,
         job_id: str,
         space_id: str = DEFAULT_SPACE_ID,
+        *,
+        drain: bool = False,
     ) -> None:
-        db = session_for_space(space_id)
-        try:
-            job = db.get(AutoScanJob, job_id)
-            if job is None:
-                raise LookupError("扫描任务不存在")
-            if job.status == "running":
-                raise RuntimeError("扫描任务正在运行")
-            job.status = "running"
-            job.last_scan_at = utc_now()
-            job.next_scan_at = next_scan_at(job, utc_now())
-            db.commit()
-        finally:
-            db.close()
-        await asyncio.to_thread(self._scan_job_sync, job_id, space_id)
+        previous_processed = -1
+        previous_run_id: str | None = None
+        # Manual "ingest this source" drains one 20-file batch at a time.
+        # The limit prevents a source that changes on every read from looping forever.
+        max_passes = 100 if drain else 1
+        for _ in range(max_passes):
+            db = session_for_space(space_id)
+            try:
+                job = db.get(AutoScanJob, job_id)
+                if job is None:
+                    raise LookupError("扫描任务不存在")
+                if job.status == "running":
+                    raise RuntimeError("扫描任务正在运行")
+                job.status = "running"
+                job.last_scan_at = utc_now()
+                job.next_scan_at = next_scan_at(job, utc_now())
+                db.commit()
+            finally:
+                db.close()
+            await asyncio.to_thread(self._scan_job_sync, job_id, space_id)
+            if not drain:
+                break
+            db = session_for_space(space_id)
+            try:
+                job = db.get(AutoScanJob, job_id)
+                if job is None:
+                    raise LookupError("扫描任务不存在")
+                if job.last_error:
+                    break
+                if (
+                    job.processed_count == previous_processed
+                    and job.last_run_id == previous_run_id
+                ):
+                    break
+                previous_processed = job.processed_count
+                previous_run_id = job.last_run_id
+            finally:
+                db.close()
 
     async def cancel_job(self, job_id: str, timeout: float = 30.0) -> bool:
         with self._event_lock:
@@ -270,6 +309,7 @@ class AutoScanScheduler:
                 job.updated_at = utc_now()
                 db.commit()
                 return
+            job.last_error = ""
             source = db.get(DataSource, job.source_id)
             if source is None:
                 raise RuntimeError("扫描任务关联的数据源不存在")
@@ -284,7 +324,6 @@ class AutoScanScheduler:
             else:
                 raise ValueError(f"不支持的扫描类型：{job.scan_type}")
             job.status = "ready"
-            job.last_error = ""
             job.updated_at = utc_now()
             db.commit()
         except Exception as error:
@@ -325,16 +364,21 @@ class AutoScanScheduler:
             raise FileNotFoundError(f"扫描目录不存在：{root}")
         iterator = root.rglob(job.file_pattern) if job.recursive else root.glob(job.file_pattern)
         processed = 0
+        active_source_objects: set[str] = set()
+        complete_snapshot = True
         for path in iterator:
             if self._is_cancelled(job.id):
                 return
             if processed >= AUTO_SCAN_MAX_FILES_PER_RUN:
+                complete_snapshot = False
                 break
             if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
                 continue
             content = path.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             item_key = f"local:{path.resolve()}"
+            source_object = str(path.resolve())
+            active_source_objects.add(source_object)
             if self._already_seen(job, item_key, digest):
                 continue
             result = self._ingest(
@@ -343,13 +387,20 @@ class AutoScanScheduler:
                 filename=path.name,
                 content=content,
                 space_id=space_id,
-                source_object=str(path.resolve()),
+                source_object=source_object,
                 source_context={"kind": "file", "path": str(path.resolve())},
             )
             if result.status == "success":
                 self._mark_seen(job, item_key, digest)
                 db.commit()
                 processed += 1
+        if complete_snapshot and not self._is_cancelled(job.id):
+            self._prune_missing_source_records(
+                db,
+                job,
+                source_id=source.id,
+                active_source_objects=active_source_objects,
+            )
 
     def _scan_remote(
         self,
@@ -397,6 +448,8 @@ class AutoScanScheduler:
 
                 walk_sftp(remote_path)
                 processed = 0
+                active_source_objects: set[str] = set()
+                complete_snapshot = True
                 for filename, full_path in candidates:
                     if self._is_cancelled(job.id):
                         return
@@ -404,6 +457,7 @@ class AutoScanScheduler:
                         content = handle.read()
                     digest = hashlib.sha256(content).hexdigest()
                     item_key = f"sftp:{host}:{full_path}"
+                    active_source_objects.add(full_path)
                     if self._already_seen(job, item_key, digest):
                         continue
                     result = self._ingest(
@@ -420,7 +474,15 @@ class AutoScanScheduler:
                         db.commit()
                         processed += 1
                     if processed >= AUTO_SCAN_MAX_FILES_PER_RUN:
+                        complete_snapshot = False
                         break
+                if complete_snapshot and not self._is_cancelled(job.id):
+                    self._prune_missing_source_records(
+                        db,
+                        job,
+                        source_id=source.id,
+                        active_source_objects=active_source_objects,
+                    )
             finally:
                 client.close()
                 transport.close()
@@ -460,6 +522,8 @@ class AutoScanScheduler:
 
                 walk_ftp(remote_path)
                 processed = 0
+                active_source_objects: set[str] = set()
+                complete_snapshot = True
                 for filename, full_path in candidates:
                     if self._is_cancelled(job.id):
                         return
@@ -468,6 +532,7 @@ class AutoScanScheduler:
                     content = buffer.getvalue()
                     digest = hashlib.sha256(content).hexdigest()
                     item_key = f"ftp:{host}:{full_path}"
+                    active_source_objects.add(full_path)
                     if self._already_seen(job, item_key, digest):
                         continue
                     result = self._ingest(
@@ -484,7 +549,15 @@ class AutoScanScheduler:
                         db.commit()
                         processed += 1
                     if processed >= AUTO_SCAN_MAX_FILES_PER_RUN:
+                        complete_snapshot = False
                         break
+                if complete_snapshot and not self._is_cancelled(job.id):
+                    self._prune_missing_source_records(
+                        db,
+                        job,
+                        source_id=source.id,
+                        active_source_objects=active_source_objects,
+                    )
             finally:
                 ftp.quit()
 
@@ -499,87 +572,111 @@ class AutoScanScheduler:
         source_type = source.source_type
         if source_type not in {"mysql", "postgres", "postgresql"}:
             raise ValueError("数据库扫描需要 MySQL 或 PostgreSQL 数据源")
+        table_names = configured_table_names(config)
+        if not table_names:
+            raise ValueError("请选择要同步的数据库表")
         engine = create_engine(
             database_url(source_type, config),
             pool_pre_ping=True,
         )
+        snapshots: list[tuple[str, list[dict[str, Any]]]] = []
         try:
-            query = database_source_query(engine, config)
-            if not query.lower().startswith("select"):
-                raise ValueError("数据库扫描只允许配置 SELECT 查询")
-            watermark = (
-                str(config.get("watermark_column", "")).strip()
-                if database_query_mode(config) == "custom"
-                or str(config.get("sync_mode") or "") == "incremental"
-                else ""
-            )
-            params: dict[str, Any] = {}
-            if watermark:
-                cursor = (job.scan_state or {}).get("cursor")
-                params["cursor"] = cursor or str(
-                    config.get("initial_cursor") or "1970-01-01T00:00:00"
-                )
             with engine.connect() as connection:
-                if self._is_cancelled(job.id):
-                    return
-                result = connection.execute(text(query), params)
-                rows = [dict(row) for row in result.mappings().all()]
+                for table_name in table_names:
+                    if self._is_cancelled(job.id):
+                        return
+                    query_config = {
+                        **config,
+                        "table_name": table_name,
+                        "sync_mode": "full",
+                        "watermark_column": "",
+                        "initial_cursor": "",
+                    }
+                    query = database_source_query(engine, query_config)
+                    if not query.lower().startswith("select"):
+                        raise ValueError("数据库扫描只允许配置 SELECT 查询")
+                    result = connection.execute(text(query))
+                    rows = [dict(row) for row in result.mappings().all()]
+                    rows.sort(
+                        key=lambda row: json.dumps(
+                            row,
+                            sort_keys=True,
+                            default=str,
+                            ensure_ascii=False,
+                        )
+                    )
+                    snapshots.append(
+                        (
+                            table_name,
+                            rows,
+                        )
+                    )
         finally:
             engine.dispose()
-        if not rows:
-            return
-        columns: list[str] = []
-        for row in rows:
-            for key in row:
-                if key not in columns:
-                    columns.append(key)
-        buffer = io.StringIO(newline="")
-        writer = csv.DictWriter(buffer, fieldnames=columns)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: _json_value(row.get(key)) for key in columns})
-        content = buffer.getvalue().encode("utf-8-sig")
-        digest = hashlib.sha256(content).hexdigest()
-        if self._already_seen(job, f"database:{job.id}", digest):
-            return
-        filename = f"{job.id}_{int(time.time())}.csv"
-        source_object = str(
-            config.get("table_name") or source.name or job.name
-        )
-        cursor_before = (
-            str(
-                (job.scan_state or {}).get("cursor")
-                or config.get("initial_cursor")
-                or "1970-01-01T00:00:00"
+        active_source_objects: set[str] = set()
+        for source_object, rows in snapshots:
+            if self._is_cancelled(job.id):
+                return
+            active_source_objects.add(source_object)
+            item_key = f"database:{job.id}:{source_object}"
+            if not rows:
+                empty_digest = hashlib.sha256(
+                    f"[]:{source_object}".encode("utf-8")
+                ).hexdigest()
+                if self._already_seen(job, item_key, empty_digest):
+                    continue
+                self._clear_source_object_snapshot(
+                    db,
+                    job,
+                    source_id=source.id,
+                    source_object=source_object,
+                )
+                self._mark_seen(job, item_key, empty_digest)
+                db.commit()
+                continue
+            columns = sorted(
+                {
+                    str(key)
+                    for row in rows
+                    for key in row
+                }
             )
-            if watermark
-            else ""
-        )
-        run = self._ingest(
+            buffer = io.StringIO(newline="")
+            writer = csv.DictWriter(buffer, fieldnames=columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {key: _json_value(row.get(key)) for key in columns}
+                )
+            content = buffer.getvalue().encode("utf-8-sig")
+            digest = hashlib.sha256(content).hexdigest()
+            if self._already_seen(job, item_key, digest):
+                continue
+            filename = f"{job.id}_{int(time.time())}.csv"
+            run = self._ingest(
+                db,
+                job,
+                filename=filename,
+                content=content,
+                space_id=space_id,
+                source_object=source_object,
+                source_context={
+                    "kind": "database",
+                    "table_name": source_object,
+                    "schema_name": str(config.get("schema_name") or ""),
+                    "dedupe_scope": source_object,
+                },
+                replace_source_object=True,
+            )
+            if run.status == "success":
+                self._mark_seen(job, item_key, digest)
+                db.commit()
+        self._prune_missing_source_records(
             db,
             job,
-            filename=filename,
-            content=content,
-            space_id=space_id,
-            source_object=source_object,
-            source_context={
-                "kind": "database",
-                "table_name": str(config.get("table_name") or ""),
-                "schema_name": str(config.get("schema_name") or ""),
-                "watermark_column": watermark,
-            },
+            source_id=source.id,
+            active_source_objects=active_source_objects,
         )
-        if run.status == "success":
-            self._mark_seen(job, f"database:{job.id}", digest)
-            cursor_after = ""
-            if watermark:
-                state = dict(job.scan_state or {})
-                state["cursor"] = _json_value(rows[-1].get(watermark))
-                job.scan_state = state
-                cursor_after = str(state["cursor"])
-            run.incremental_cursor_before = cursor_before
-            run.incremental_cursor_after = cursor_after
-            db.commit()
 
     def _scan_api(
         self,
@@ -591,13 +688,24 @@ class AutoScanScheduler:
         config = resolved_source_config(source)
         if self._is_cancelled(job.id):
             return
-        filename, content, _row_count = request_api_source(
+        filename, content, row_count = request_api_source(
             config,
             source_name=source.name,
         )
         digest = hashlib.sha256(content).hexdigest()
         item_key = f"api:{source.id}:{config.get('url', '')}"
+        source_object = str(config.get("url") or source.name)
         if self._already_seen(job, item_key, digest):
+            return
+        if row_count == 0:
+            self._clear_source_object_snapshot(
+                db,
+                job,
+                source_id=source.id,
+                source_object=source_object,
+            )
+            self._mark_seen(job, item_key, digest)
+            db.commit()
             return
         result = self._ingest(
             db,
@@ -605,7 +713,7 @@ class AutoScanScheduler:
             filename=filename,
             content=content,
             space_id=space_id,
-            source_object=str(config.get("url") or source.name),
+            source_object=source_object,
             source_context={"kind": "api", "url": str(config.get("url") or "")},
         )
         if result.status == "success":
@@ -622,6 +730,7 @@ class AutoScanScheduler:
         space_id: str,
         source_object: str = "",
         source_context: dict[str, Any] | None = None,
+        replace_source_object: bool = True,
     ) -> IngestionRun:
         template_code = job.template_code
         if template_code == "auto":
@@ -638,14 +747,135 @@ class AutoScanScheduler:
             source_object=source_object,
             source_context=source_context,
         )
-        run_pipeline(run.id, space_id)
+        snapshot_fingerprints = run_pipeline(run.id, space_id)
         db.refresh(run)
         job.last_run_id = run.id
         if run.status == "success":
+            if replace_source_object and snapshot_fingerprints is not None:
+                self._replace_source_object_records(
+                    db,
+                    job,
+                    source_object=run.source_object,
+                    fingerprints=snapshot_fingerprints,
+                )
             job.processed_count += 1
-        job.last_error = "" if run.status == "success" else run.error_message
+        elif run.error_message:
+            job.last_error = job.last_error or run.error_message
         db.commit()
         return run
+
+    @staticmethod
+    def _refresh_dataset_record_count(db, dataset: Dataset) -> None:
+        if dataset.physical_table:
+            dataset.record_count = count_dedicated_records(
+                db.get_bind(),
+                dataset.physical_table,
+            )
+            return
+        dataset.record_count = int(
+            db.scalar(
+                select(func.count(DatasetRecord.id)).where(
+                    DatasetRecord.dataset_id == dataset.id
+                )
+            )
+            or 0
+        )
+
+    def _replace_source_object_records(
+        self,
+        db,
+        job: AutoScanJob,
+        *,
+        source_object: str,
+        fingerprints: set[str],
+    ) -> None:
+        dataset = db.get(Dataset, job.dataset_id)
+        if dataset is None:
+            return
+        if dataset.physical_table:
+            delete_dedicated_source_records(
+                db.get_bind(),
+                dataset.physical_table,
+                source_id=job.source_id,
+                source_object=source_object,
+                keep_fingerprints=fingerprints,
+            )
+        else:
+            stale_ids = [
+                record.id
+                for record in db.query(
+                    DatasetRecord.id,
+                    DatasetRecord.fingerprint,
+                )
+                .filter(
+                    DatasetRecord.dataset_id == job.dataset_id,
+                    DatasetRecord.source_id == job.source_id,
+                    DatasetRecord.source_object == source_object,
+                )
+                .all()
+                if record.fingerprint not in fingerprints
+            ]
+            if stale_ids:
+                db.query(DatasetRecord).filter(
+                    DatasetRecord.id.in_(stale_ids)
+                ).delete(synchronize_session=False)
+        self._refresh_dataset_record_count(db, dataset)
+
+    def _clear_source_object_snapshot(
+        self,
+        db,
+        job: AutoScanJob,
+        *,
+        source_id: str,
+        source_object: str,
+    ) -> None:
+        dataset = db.get(Dataset, job.dataset_id)
+        if dataset is None:
+            return
+        if dataset.physical_table:
+            delete_dedicated_source_records(
+                db.get_bind(),
+                dataset.physical_table,
+                source_id=source_id,
+                source_object=source_object,
+            )
+        else:
+            db.query(DatasetRecord).filter(
+                DatasetRecord.dataset_id == job.dataset_id,
+                DatasetRecord.source_id == source_id,
+                DatasetRecord.source_object == source_object,
+            ).delete(synchronize_session=False)
+        self._refresh_dataset_record_count(db, dataset)
+
+    def _prune_missing_source_records(
+        self,
+        db,
+        job: AutoScanJob,
+        *,
+        source_id: str,
+        active_source_objects: set[str],
+    ) -> None:
+        dataset = db.get(Dataset, job.dataset_id)
+        if dataset is None:
+            return
+        if dataset.physical_table:
+            prune_dedicated_source_records(
+                db.get_bind(),
+                dataset.physical_table,
+                source_id=source_id,
+                active_source_objects=active_source_objects,
+            )
+        else:
+            query = db.query(DatasetRecord).filter(
+                DatasetRecord.dataset_id == job.dataset_id,
+                DatasetRecord.source_id == source_id,
+            )
+            if active_source_objects:
+                query = query.filter(
+                    DatasetRecord.source_object.notin_(active_source_objects)
+                )
+            query.delete(synchronize_session=False)
+        self._refresh_dataset_record_count(db, dataset)
 
     @staticmethod
     def _allowed_filename(filename: str, pattern: str) -> bool:

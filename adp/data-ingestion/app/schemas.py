@@ -54,13 +54,13 @@ class DataSpaceOut(ORMModel):
 
 
 class DataSourceCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=120)
     source_type: str = "upload"
-    config: dict[str, Any] = {}
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class DataSourceUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
     source_type: str | None = None
     config: dict[str, Any] | None = None
 
@@ -396,7 +396,7 @@ class AgentMemoryCreate(BaseModel):
 
 
 class AutoScanJobCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=160)
     source_id: str
     dataset_id: str
     template_code: str = "auto"
@@ -414,7 +414,7 @@ class AutoScanJobCreate(BaseModel):
 
 
 class AutoScanJobUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=160)
     dataset_id: str | None = None
     template_code: str | None = None
     path: str | None = None

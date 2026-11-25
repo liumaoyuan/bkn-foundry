@@ -79,12 +79,14 @@ class RemoteAutoScanTest(unittest.TestCase):
                 "_ingest",
                 return_value=SimpleNamespace(status="success"),
             ) as ingest,
+            patch.object(scheduler, "_prune_missing_source_records") as prune,
         ):
             scheduler._scan_remote(FakeDb(), job, source, "default")
 
         transport.return_value.connect.assert_called_once()
         self.assertEqual(ingest.call_count, 1)
         self.assertEqual(ingest.call_args.kwargs["filename"], "file-20.csv")
+        prune.assert_called_once()
 
     def test_sftp_recursive_scan_enters_child_directories(self) -> None:
         scheduler = AutoScanScheduler()
@@ -121,6 +123,7 @@ class RemoteAutoScanTest(unittest.TestCase):
                 "_ingest",
                 return_value=SimpleNamespace(status="success"),
             ) as ingest,
+            patch.object(scheduler, "_prune_missing_source_records"),
         ):
             scheduler._scan_remote(FakeDb(), job, source, "default")
 
@@ -143,6 +146,42 @@ class RemoteAutoScanTest(unittest.TestCase):
         with patch("app.auto_scan.session_for_space", return_value=db):
             scheduler._scan_job_sync("job-1", "default")
         self.assertEqual(job.status, "ready")
+
+    def test_scan_result_error_is_not_cleared_by_job_status(self) -> None:
+        scheduler = AutoScanScheduler()
+        source = DataSource(
+            name="Local",
+            source_type="local_dir",
+            config={"path": "/data"},
+        )
+        job = AutoScanJob(
+            name="local",
+            source_id="source-1",
+            dataset_id="dataset-1",
+            template_code="auto",
+            scan_type="local",
+            status="running",
+            enabled=True,
+        )
+
+        class JobDb(FakeDb):
+            def get(self, model, _identifier):
+                return job if model is AutoScanJob else source
+
+            def rollback(self) -> None:
+                return None
+
+        def fail_scan(_db, current_job, _source, _space_id):
+            current_job.last_error = "入库失败：测试错误"
+
+        with (
+            patch("app.auto_scan.session_for_space", return_value=JobDb()),
+            patch.object(scheduler, "_scan_local", side_effect=fail_scan),
+        ):
+            scheduler._scan_job_sync("job-1", "default")
+
+        self.assertEqual(job.status, "ready")
+        self.assertEqual(job.last_error, "入库失败：测试错误")
 
     def test_cancel_job_signals_worker_and_waits_for_completion(self) -> None:
         scheduler = AutoScanScheduler()

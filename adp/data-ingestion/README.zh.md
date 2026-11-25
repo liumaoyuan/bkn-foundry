@@ -15,7 +15,8 @@
 ## 集成约束
 
 - OpenBKN 网关路径为 `/api/data-ingestion`，服务内部继续使用原项目的 `/api` 路径。
-- 数据库使用独立的 `data_ingestion` schema，不写 Vega 或 BKN 表。
+- 数据库使用独立的 `data_ingestion` schema，不写 Vega 或 BKN 表；控制库支持
+  MySQL、MariaDB 和 PostgreSQL。
 - 原始文件和中间产物进入现有 MinIO/S3。
 - 自动扫描首版依赖进程内调度器，因此生产副本数固定为 1。
 - 所有公开请求先经过 Hydra introspection，再通过 bkn-safe 校验
@@ -35,6 +36,7 @@
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements-dev.txt
+DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1:5432/data_ingestion \
 DATA_INGESTION_AUTH_ENABLED=false uvicorn app.main:app --reload --port 8000
 make test
 ```
