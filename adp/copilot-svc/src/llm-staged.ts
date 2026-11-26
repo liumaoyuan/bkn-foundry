@@ -56,9 +56,17 @@ async function runStage<T>(
   system: string,
   user: string,
   stages: { stage: string; ms: number; attempt: number }[],
+  onProgress?: (event: StagedProgress) => void,
 ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
   let lastError = "";
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    if (attempt > 1) {
+      onProgress?.({
+        stage: stage as StagedProgress["stage"],
+        status: "running",
+        detail: `第 ${attempt} 次尝试（${lastError}）`,
+      });
+    }
     const startedAt = Date.now();
     try {
       const messages: { role: "user" | "system" | "assistant"; content: string }[] =
@@ -171,7 +179,7 @@ export async function extractIrStagedWithPlatform(
     networkName?: string;
     description?: string;
     objectTypes?: StageObject[];
-  }>(token, model, modelId, "objects", OBJECT_PROMPT, source, stages);
+  }>(token, model, modelId, "objects", OBJECT_PROMPT, source, stages, onProgress);
   if (!objectsStage.ok) {
     onProgress?.({ stage: "objects", status: "done", error: objectsStage.error });
     return { ok: false, error: objectsStage.error, stages };
@@ -222,6 +230,7 @@ export async function extractIrStagedWithPlatform(
     RELATION_PROMPT,
     relationInput,
     stages,
+    onProgress,
   );
   if (!relationStage.ok) return { ok: false, error: relationStage.error, stages };
   const rawRelations = pickArray(
@@ -299,6 +308,7 @@ export async function extractIrStagedWithPlatform(
       RELATION_PROMPT,
       `${relationInput}\n\n至少给出 3 条关系；source/target 必须直接复制对象清单里的 id 字符串。`,
       stages,
+      onProgress,
     );
     if (retry.ok) {
       const retryRaw = pickArray(
@@ -326,7 +336,7 @@ export async function extractIrStagedWithPlatform(
   const actionStage = await runStage<{
     actionTypes?: Record<string, unknown>[];
     riskTypes?: Record<string, unknown>[];
-  }>(token, model, modelId, "actions", ACTION_PROMPT, actionInput, stages);
+  }>(token, model, modelId, "actions", ACTION_PROMPT, actionInput, stages, onProgress);
   if (!actionStage.ok) {
     warnings.push(`行动/风险阶段失败：${actionStage.error}，已保留对象与关系`);
   }
