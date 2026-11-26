@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -92,8 +92,17 @@ def validate_scan_requirements(
     if scan_type in {"ftp", "sftp"} and not source.config.get("host"):
         raise HTTPException(status_code=400, detail="FTP/SFTP 数据源缺少主机地址")
     if scan_type == "database":
-        if not configured_table_names(source.config):
+        try:
+            table_names = configured_table_names(source.config)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if not table_names:
             raise HTTPException(status_code=400, detail="请选择要同步的数据库表")
+        if len(table_names) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="一个数据库数据源只能绑定一张表",
+            )
     if scan_type == "api" and not str(source.config.get("url") or "").strip():
         raise HTTPException(status_code=400, detail="API 数据源缺少接口地址")
 
@@ -237,10 +246,35 @@ async def delete_job(job_id: str, db: Session = Depends(get_db)) -> dict[str, bo
 async def run_job_now(
     job_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     drain: bool = False,
+    wait: bool = True,
     _space_db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     space_id = current_space_id(request)
+    if not wait:
+        db = session_for_space(space_id)
+        try:
+            job = db.get(AutoScanJob, job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="扫描任务不存在")
+            if job.status in {"queued", "running"}:
+                raise HTTPException(status_code=409, detail="扫描任务正在运行")
+            job.status = "queued"
+            job.last_error = ""
+            job.updated_at = utc_now()
+            db.commit()
+            db.refresh(job)
+            response = serialize_job(load_job(db, job.id))
+        finally:
+            db.close()
+        background_tasks.add_task(
+            auto_scan_scheduler.run_job_now,
+            job_id,
+            space_id,
+            drain=drain,
+        )
+        return response
     try:
         await auto_scan_scheduler.run_job_now(
             job_id,

@@ -5,6 +5,7 @@ from typing import Any
 
 from .models import DataSource
 from .secret_store import decrypt_secret, encrypt_secret
+from .source_connectors import configured_table_names
 
 
 SECRET_KEYS = {"password", "api_key", "secret", "private_key"}
@@ -38,17 +39,7 @@ def validate_source_config(source_type: str, config: dict[str, Any]) -> None:
         return
     if str(config.get("query_mode") or "table") != "table":
         raise ValueError("数据库数据源必须选择数据表")
-    table_names = config.get("table_names")
-    names = (
-        [
-            value.strip()
-            for value in table_names
-            if isinstance(value, str) and value.strip()
-        ]
-        if isinstance(table_names, list)
-        else []
-    )
-    if not names and not str(config.get("table_name") or "").strip():
+    if not configured_table_names(config):
         raise ValueError("请选择需要同步的数据表")
 
 

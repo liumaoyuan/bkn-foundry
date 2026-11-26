@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,30 @@ from sqlalchemy.orm import Session
 from .file_inspector import inspect_file
 from .models import Dataset, IngestionRun, PipelineTemplate, StageRun
 from .storage import storage
+
+
+def content_fingerprint(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def find_duplicate_ingestion_run(
+    db: Session,
+    *,
+    dataset_id: str,
+    fingerprint: str,
+) -> IngestionRun | None:
+    if not fingerprint:
+        return None
+    return db.scalar(
+        select(IngestionRun)
+        .where(
+            IngestionRun.dataset_id == dataset_id,
+            IngestionRun.fingerprint == fingerprint,
+            IngestionRun.status.in_(["queued", "running", "success"]),
+        )
+        .order_by(IngestionRun.created_at.desc())
+        .limit(1)
+    )
 
 
 class IngestionValidationError(RuntimeError):
@@ -73,6 +98,7 @@ def create_ingestion_run(
         template_code=template_code,
         status="queued",
         original_name=safe_filename,
+        fingerprint=content_fingerprint(content),
         source_object=source_object or safe_filename,
         source_context=source_context or {},
         file_type=inspection["file_type"],

@@ -63,6 +63,9 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 APP_NAME = os.getenv("APP_NAME", "九格多源数据入库系统")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(512 * 1024 * 1024)))
+MAX_DOCUMENT_TEXT_CHARS = int(
+    os.getenv("MAX_DOCUMENT_TEXT_CHARS", "1000000")
+)
 DEDICATED_RECORD_THRESHOLD = int(
     os.getenv("DEDICATED_RECORD_THRESHOLD", "100000")
 )

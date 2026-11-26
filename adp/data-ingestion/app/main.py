@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -73,7 +72,6 @@ from .record_storage import (
 from .schemas import (
     DatabaseCatalogRequest,
     DataSourceCreate,
-    DataSourceOut,
     DataSourceUpdate,
     DatasetOut,
     DatasetUpdate,
@@ -96,7 +94,12 @@ from .capability_api import router as capability_router
 from .space_api import router as space_router
 from .auth import PlatformAuthMiddleware
 from .config import CORS_ALLOW_ORIGINS
-from .ingestion_service import IngestionValidationError, create_ingestion_run
+from .ingestion_service import (
+    IngestionValidationError,
+    content_fingerprint,
+    create_ingestion_run,
+    find_duplicate_ingestion_run,
+)
 from .data_source_service import (
     prepare_source_config,
     prepare_source_config_update,
@@ -503,13 +506,13 @@ def create_dataset(
     name: Annotated[str, Form()],
     description: Annotated[str, Form()] = "",
     data_type: Annotated[str, Form()] = "mixed",
-    storage_mode: Annotated[str, Form()] = "auto",
+    storage_mode: Annotated[str, Form()] = "dedicated",
     upsert_keys: Annotated[str, Form()] = "",
     db: Session = Depends(get_db),
 ) -> Dataset:
-    storage_mode = storage_mode.strip().lower()
-    if storage_mode not in {"auto", "shared", "dedicated"}:
-        raise HTTPException(status_code=400, detail="数据集存储模式无效")
+    # A dataset is the durable unit exposed to downstream consumers. Keep one
+    # physical table per dataset so source bindings cannot mix tables together.
+    storage_mode = "dedicated"
     slug = "-".join(name.lower().split()) or f"dataset-{int(datetime.now().timestamp())}"
     if db.scalar(select(Dataset.id).where(Dataset.slug == slug)):
         raise HTTPException(status_code=409, detail="同名数据集已存在")
@@ -529,28 +532,27 @@ def create_dataset(
     db.add(dataset)
     db.commit()
     db.refresh(dataset)
-    if storage_mode == "dedicated":
-        from .record_storage import ensure_dataset_table
+    from .record_storage import ensure_dataset_table
 
-        try:
-            dataset.physical_table = ensure_dataset_table(
-                db.get_bind(),
-                dataset,
-            )
-            dataset.partition_mode = (
-                "month"
-                if db.get_bind().dialect.name in {"mysql", "mariadb"}
-                else ""
-            )
-            db.commit()
-            db.refresh(dataset)
-        except Exception as error:
-            db.delete(dataset)
-            db.commit()
-            raise HTTPException(
-                status_code=503,
-                detail="独立数据表创建失败",
-            ) from error
+    try:
+        dataset.physical_table = ensure_dataset_table(
+            db.get_bind(),
+            dataset,
+        )
+        dataset.partition_mode = (
+            "month"
+            if db.get_bind().dialect.name in {"mysql", "mariadb"}
+            else ""
+        )
+        db.commit()
+        db.refresh(dataset)
+    except Exception as error:
+        db.delete(dataset)
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="独立数据表创建失败",
+        ) from error
     return dataset
 
 
@@ -1487,6 +1489,17 @@ async def create_run(
     filename = Path(file.filename or "unnamed").name
     content = await read_upload_bytes(file)
     source = db.get(DataSource, source_id) if source_id else None
+    fingerprint = content_fingerprint(content)
+    duplicate = find_duplicate_ingestion_run(
+        db,
+        dataset_id=dataset_id,
+        fingerprint=fingerprint,
+    )
+    if duplicate is not None:
+        return {
+            **serialize_run(duplicate),
+            "duplicate": True,
+        }
 
     try:
         run = create_ingestion_run(
@@ -1544,6 +1557,7 @@ def retry_run(
         file_type=previous.file_type,
         media_type=previous.media_type,
         file_size=previous.file_size,
+        fingerprint=content_fingerprint(content),
         incremental_cursor_before=previous.incremental_cursor_before,
         incremental_cursor_after="",
     )

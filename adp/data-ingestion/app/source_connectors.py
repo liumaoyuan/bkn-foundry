@@ -66,6 +66,9 @@ def database_query_mode(config: dict[str, Any]) -> str:
 
 
 def configured_table_names(config: dict[str, Any]) -> list[str]:
+    table_name = str(config.get("table_name") or "").strip()
+    if table_name:
+        return [table_name]
     values = config.get("table_names")
     if isinstance(values, list):
         names = list(
@@ -75,10 +78,11 @@ def configured_table_names(config: dict[str, Any]) -> list[str]:
                 if isinstance(value, str) and value.strip()
             )
         )
+        if len(names) > 1:
+            raise ValueError("一个数据库数据源只能绑定一张表")
         if names:
             return names
-    table_name = str(config.get("table_name") or "").strip()
-    return [table_name] if table_name else []
+    return []
 
 
 def _column_type_name(column: dict[str, Any]) -> str:
@@ -217,10 +221,6 @@ def database_source_query(engine: Engine, config: dict[str, Any]) -> str:
     table_names.update(inspector.get_view_names(schema=schema_name))
     if table_name not in table_names:
         raise ValueError(f"数据库中不存在表或视图：{table_name}")
-    columns = {
-        str(column["name"])
-        for column in inspector.get_columns(table_name, schema=schema_name)
-    }
     quote = engine.dialect.identifier_preparer.quote
     qualified_table = (
         f"{quote(schema_name)}.{quote(table_name)}"
