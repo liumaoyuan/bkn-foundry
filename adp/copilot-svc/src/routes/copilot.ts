@@ -1053,7 +1053,7 @@ export async function copilotRoutes(app: FastifyInstance) {
         id: "parse",
         status: "done",
         label: "解析上传文件",
-        detail: `${fileNames.length} 个文件 / 约 ${sourceText.length} 字${fileErrors.length ? ` / ${fileErrors.length} 个失败` : ""}`,
+        detail: `${fileNames.length} 个文件 / 约 ${sourceText.length} 字${tables.length ? ` / ${tables.length} 张表` : ""}${fileErrors.length ? ` / ${fileErrors.length} 个失败` : ""}`,
       });
 
       let mode: "llm" | "heuristic" = "heuristic";
@@ -1140,7 +1140,13 @@ export async function copilotRoutes(app: FastifyInstance) {
         schemaMode ? [...tables, ...schemaToTables(mergedSchema)] : tables,
       );
       const grounded = attachEvidence(binding.ir, evidenceSources);
-      send({ type: "step", id: "bind", status: "done", label: "推断数据绑定与证据" });
+      send({
+        type: "step",
+        id: "bind",
+        status: "done",
+        label: "推断数据绑定与证据",
+        detail: `${binding.stats.boundObjects}/${binding.stats.objects} 个对象匹配来源表、${binding.stats.mappedProperties}/${binding.stats.properties} 个属性`,
+      });
 
       send({
         type: "result",
@@ -1643,6 +1649,27 @@ export async function copilotRoutes(app: FastifyInstance) {
   });
 
   // ---- 线上网络结构（AI 编辑：预览 → 执行 → 回滚） ----
+  /**
+   * AI 编辑使用的模型：优先使用「模型连接」里选定的平台模型；
+   * 未选定则自动回退到平台「模型管理 → 模型配置」里的默认模型，
+   * 保证只要平台配置过模型就能直接使用。
+   */
+  async function resolveNetworkEditModel(token: string): Promise<{ modelId: string; modelName: string }> {
+    const settings = readModelSettings();
+    if (settings?.mode === "platform" && settings.platformModel) {
+      return {
+        modelId: settings.platformModel,
+        modelName: (settings.platformModelName ?? settings.platformModel).trim(),
+      };
+    }
+    const models = await listPlatformModels(token);
+    const fallback = models.find((model) => model.isDefault) ?? models[0];
+    if (!fallback) {
+      throw new Error("平台还没有可用的大模型，请先在「模型管理 → 模型配置」中添加模型");
+    }
+    return { modelId: fallback.id, modelName: fallback.name };
+  }
+
   app.post("/network/:networkId/plan/stream", async (request, reply) => {
     reply.raw.writeHead(200, {
       "content-type": "application/x-ndjson; charset=utf-8",
@@ -1669,17 +1696,22 @@ export async function copilotRoutes(app: FastifyInstance) {
         reply.raw.end();
         return;
       }
-      const settings = readModelSettings();
-      if (!settings || settings.mode !== "platform" || !settings.platformModel) {
-        send({ type: "result", ok: false, error: "AI 编辑需要平台模型模式，请先在「模型连接」选择平台模型" });
+      let editModel: { modelId: string; modelName: string };
+      try {
+        editModel = await resolveNetworkEditModel(token);
+      } catch (modelError) {
+        send({
+          type: "result",
+          ok: false,
+          error: modelError instanceof Error ? modelError.message : "平台模型不可用，请检查「模型管理 → 模型配置」",
+        });
         reply.raw.end();
         return;
       }
-      const modelName = (settings.platformModelName ?? settings.platformModel).trim();
       const plan = await planNetworkEdit(
         token,
-        modelName,
-        settings.platformModel,
+        editModel.modelName,
+        editModel.modelId,
         networkId,
         message,
         (event) => {
@@ -1698,7 +1730,7 @@ export async function copilotRoutes(app: FastifyInstance) {
           });
         },
       );
-      send({ type: "result", ok: true, plan });
+      send({ type: "result", ok: true, plan, model: editModel.modelName });
       reply.raw.end();
     } catch (error) {
       send({ type: "result", ok: false, error: error instanceof Error ? error.message : "生成变更计划失败" });
@@ -1772,15 +1804,19 @@ export async function copilotRoutes(app: FastifyInstance) {
       reply.code(400);
       return { ok: false, error: "请描述要修改的内容" };
     }
-    const settings = readModelSettings();
-    if (!settings || settings.mode !== "platform" || !settings.platformModel) {
-      reply.code(400);
-      return { ok: false, error: "AI 编辑需要平台模型模式，请先在「模型连接」选择平台模型" };
-    }
-    const modelName = (settings.platformModelName ?? settings.platformModel).trim();
+    let editModel: { modelId: string; modelName: string };
     try {
-      const plan = await planNetworkEdit(token, modelName, settings.platformModel, networkId, message);
-      return { ok: true, plan };
+      editModel = await resolveNetworkEditModel(token);
+    } catch (modelError) {
+      reply.code(400);
+      return {
+        ok: false,
+        error: modelError instanceof Error ? modelError.message : "平台模型不可用，请检查「模型管理 → 模型配置」",
+      };
+    }
+    try {
+      const plan = await planNetworkEdit(token, editModel.modelName, editModel.modelId, networkId, message);
+      return { ok: true, plan, model: editModel.modelName };
     } catch (error) {
       reply.code(502);
       return { ok: false, error: error instanceof Error ? error.message : "生成变更计划失败" };
