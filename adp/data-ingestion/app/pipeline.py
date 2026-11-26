@@ -12,7 +12,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 
-from .config import DATA_DIR
+from .config import DATA_DIR, MAX_DOCUMENT_TEXT_CHARS
 from .database import DEFAULT_SPACE_ID, session_for_space
 from .document_extraction import extract_document_content
 from .file_inspector import (
@@ -76,6 +76,31 @@ def payload_fingerprint(
         default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_document_payload(
+    *,
+    filename: str,
+    file_type: str,
+    media_type: str,
+    size: int,
+    metadata: dict[str, Any],
+    recognized_text: str,
+    artifact_path: str,
+) -> dict[str, Any]:
+    saved_text = recognized_text[:MAX_DOCUMENT_TEXT_CHARS]
+    return {
+        "filename": filename,
+        "file_type": file_type,
+        "media_type": media_type,
+        "size": size,
+        "metadata": metadata,
+        "recognized_text": saved_text,
+        "text_length": len(recognized_text),
+        "text_truncated": len(recognized_text) > MAX_DOCUMENT_TEXT_CHARS,
+        "text_preview": recognized_text[:4000],
+        "artifact_path": artifact_path,
+    }
 
 
 def record_source_locator(
@@ -682,14 +707,15 @@ def run_pipeline(
                         {"sha256": run.fingerprint},
                         source_object=fingerprint_scope,
                     ),
-                    "payload": {
-                        "filename": run.original_name,
-                        "file_type": file_type,
-                        "media_type": run.media_type,
-                        "size": run.file_size,
-                        "metadata": metadata,
-                        "text_preview": normalized_text[:4000],
-                    },
+                    "payload": build_document_payload(
+                        filename=run.original_name,
+                        file_type=file_type,
+                        media_type=run.media_type,
+                        size=run.file_size,
+                        metadata=metadata,
+                        recognized_text=normalized_text,
+                        artifact_path=artifact_path,
+                    ),
                 }
             ]
         snapshot_fingerprints = {

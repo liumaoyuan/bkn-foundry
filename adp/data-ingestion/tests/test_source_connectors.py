@@ -202,16 +202,20 @@ class SourceConnectorTest(unittest.TestCase):
         )
         validate_scan_requirements(source, "database", "")
 
-    def test_multiple_table_configuration_is_supported(self) -> None:
+    def test_database_source_binds_exactly_one_table(self) -> None:
+        config = {
+            "query_mode": "table",
+            "table_name": "customers",
+        }
+        validate_source_config("mysql", config)
+        self.assertEqual(configured_table_names(config), ["customers"])
+
         config = {
             "query_mode": "table",
             "table_names": ["customers", "orders", "customers"],
         }
-        validate_source_config("mysql", config)
-        self.assertEqual(
-            configured_table_names(config),
-            ["customers", "orders"],
-        )
+        with self.assertRaisesRegex(ValueError, "只能绑定一张表"):
+            validate_source_config("mysql", config)
 
     def test_unsupported_source_and_custom_sql_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "不支持的数据源类型"):

@@ -18,7 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from sqlalchemy import create_engine, func, or_, select, text
+from sqlalchemy import create_engine, func, inspect as sqlalchemy_inspect, or_, select, text
 
 from .config import (
     AUTO_SCAN_ENABLED,
@@ -33,7 +33,11 @@ from .database import (
 )
 from .data_source_service import resolved_source_config
 from .file_inspector import inspect_file
-from .ingestion_service import IngestionValidationError, create_ingestion_run
+from .ingestion_service import (
+    content_fingerprint,
+    create_ingestion_run,
+    find_duplicate_ingestion_run,
+)
 from .models import (
     AutoScanJob,
     DataSource,
@@ -575,16 +579,35 @@ class AutoScanScheduler:
         table_names = configured_table_names(config)
         if not table_names:
             raise ValueError("请选择要同步的数据库表")
+        if len(table_names) != 1:
+            raise ValueError("一个数据库数据源只能绑定一张表")
+        job.scan_state = {
+            **(job.scan_state or {}),
+            "unchanged": False,
+        }
         engine = create_engine(
             database_url(source_type, config),
             pool_pre_ping=True,
         )
         snapshots: list[tuple[str, list[dict[str, Any]]]] = []
+        primary_keys_by_table: dict[str, list[str]] = {}
         try:
             with engine.connect() as connection:
+                inspector = sqlalchemy_inspect(engine)
+                schema_name = str(config.get("schema_name") or "").strip() or None
                 for table_name in table_names:
                     if self._is_cancelled(job.id):
                         return
+                    primary_keys_by_table[table_name] = [
+                        str(item)
+                        for item in (
+                            inspector.get_pk_constraint(
+                                table_name,
+                                schema=schema_name,
+                            )
+                            or {}
+                        ).get("constrained_columns", [])
+                    ]
                     query_config = {
                         **config,
                         "table_name": table_name,
@@ -613,6 +636,21 @@ class AutoScanScheduler:
                     )
         finally:
             engine.dispose()
+        dataset = db.get(Dataset, job.dataset_id)
+        if (
+            dataset is not None
+            and not list(dataset.upsert_keys or [])
+            and snapshots
+            and snapshots[0][1]
+        ):
+            primary_keys = [
+                key
+                for key in primary_keys_by_table.get(snapshots[0][0], [])
+                if key in snapshots[0][1][0]
+            ]
+            if primary_keys:
+                dataset.upsert_keys = primary_keys
+                db.commit()
         active_source_objects: set[str] = set()
         for source_object, rows in snapshots:
             if self._is_cancelled(job.id):
@@ -650,7 +688,18 @@ class AutoScanScheduler:
                 )
             content = buffer.getvalue().encode("utf-8-sig")
             digest = hashlib.sha256(content).hexdigest()
-            if self._already_seen(job, item_key, digest):
+            if self._already_seen(job, item_key, digest) or self._latest_database_digest_matches(
+                db,
+                job,
+                source_object=source_object,
+                digest=digest,
+            ):
+                self._mark_seen(job, item_key, digest)
+                job.scan_state = {
+                    **(job.scan_state or {}),
+                    "unchanged": True,
+                }
+                db.commit()
                 continue
             filename = f"{job.id}_{int(time.time())}.csv"
             run = self._ingest(
@@ -664,12 +713,22 @@ class AutoScanScheduler:
                     "kind": "database",
                     "table_name": source_object,
                     "schema_name": str(config.get("schema_name") or ""),
+                    "primary_key_fields": primary_keys_by_table.get(
+                        source_object,
+                        [],
+                    ),
                     "dedupe_scope": source_object,
+                    "table_digest": digest,
                 },
                 replace_source_object=True,
+                dedupe_existing_file=False,
             )
             if run.status == "success":
                 self._mark_seen(job, item_key, digest)
+                job.scan_state = {
+                    **(job.scan_state or {}),
+                    "unchanged": False,
+                }
                 db.commit()
         self._prune_missing_source_records(
             db,
@@ -731,11 +790,29 @@ class AutoScanScheduler:
         source_object: str = "",
         source_context: dict[str, Any] | None = None,
         replace_source_object: bool = True,
+        dedupe_existing_file: bool = True,
     ) -> IngestionRun:
         template_code = job.template_code
         if template_code == "auto":
             inspection = inspect_file(filename, content)
             template_code = inspection["recommended_pipeline"]
+        duplicate = (
+            find_duplicate_ingestion_run(
+                db,
+                dataset_id=job.dataset_id,
+                fingerprint=content_fingerprint(content),
+            )
+            if dedupe_existing_file
+            else None
+        )
+        if duplicate is not None:
+            job.last_run_id = duplicate.id
+            job.scan_state = {
+                **(job.scan_state or {}),
+                "unchanged": True,
+            }
+            db.commit()
+            return duplicate
         run = create_ingestion_run(
             db,
             filename=filename,
@@ -888,6 +965,34 @@ class AutoScanScheduler:
     def _already_seen(job: AutoScanJob, item_key: str, digest: str) -> bool:
         seen = (job.scan_state or {}).get("seen", {})
         return seen.get(item_key) == digest
+
+    @staticmethod
+    def _latest_database_digest_matches(
+        db,
+        job: AutoScanJob,
+        *,
+        source_object: str,
+        digest: str,
+    ) -> bool:
+        dataset = db.get(Dataset, job.dataset_id)
+        if dataset is None or int(dataset.record_count or 0) <= 0:
+            return False
+        latest_run = db.scalar(
+            select(IngestionRun)
+            .where(
+                IngestionRun.dataset_id == job.dataset_id,
+                IngestionRun.source_id == job.source_id,
+                IngestionRun.source_object == source_object,
+                IngestionRun.status == "success",
+            )
+            .order_by(IngestionRun.created_at.desc())
+            .limit(1)
+        )
+        return bool(
+            latest_run
+            and str((latest_run.source_context or {}).get("table_digest") or "")
+            == digest
+        )
 
     @staticmethod
     def _mark_seen(job: AutoScanJob, item_key: str, digest: str) -> None:
