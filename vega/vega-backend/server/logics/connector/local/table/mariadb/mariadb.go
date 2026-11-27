@@ -241,8 +241,15 @@ func (c *MariaDBConnector) connectionString() string {
 	for k, v := range c.config.Options {
 		values.Set(k, v.(string))
 	}
-	values.Set("loc", common.ServerTimeZone())
-	values.Set("time_zone", "'"+common.ServerTimeZone()+"'")
+	serverTimeZone := common.ServerTimeZone()
+	values.Set("loc", serverTimeZone)
+	// MySQL requires its timezone tables for named zones such as UTC. A numeric
+	// offset is equivalent for UTC and works even when those tables are absent.
+	sessionTimeZone := serverTimeZone
+	if sessionTimeZone == "UTC" || sessionTimeZone == "Etc/UTC" {
+		sessionTimeZone = "+00:00"
+	}
+	values.Set("time_zone", "'"+sessionTimeZone+"'")
 
 	return fmt.Sprintf("%s:%s@tcp(%s)/?%s",
 		c.config.Username,

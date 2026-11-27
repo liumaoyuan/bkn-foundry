@@ -1,0 +1,16 @@
+{{- if .Values.mcp.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-ingestion-mcp
+  labels:
+    app.kubernetes.io/name: data-ingestion-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: data-ingestion-mcp
+  ports:
+    - name: mcp
+      port: {{ .Values.mcp.port }}
+      targetPort: mcp
+{{- end }}

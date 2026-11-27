@@ -162,6 +162,54 @@
       ]
     },
     {
+      "id": "data_ingestion",
+      "name": "多源数据入库",
+      "_source": "adp/data-ingestion",
+      "_note": "Standalone authorization root for file and multi-source ingestion, scheduled scans, the built-in ingestion Agent, and its MCP surface.",
+      "operations": [
+        {
+          "id": "view",
+          "name": "查看",
+          "description": "查看数据源、数据集、入库任务、扫描计划和数据目录。"
+        },
+        {
+          "id": "create",
+          "name": "新建",
+          "description": "创建数据集、数据源和文件入库任务。"
+        },
+        {
+          "id": "modify",
+          "name": "修改",
+          "description": "修改数据源配置和自动扫描配置。",
+          "requires": ["view"]
+        },
+        {
+          "id": "delete",
+          "name": "删除",
+          "description": "删除自动扫描任务和 Agent 会话等可删除对象。",
+          "requires": ["view"]
+        },
+        {
+          "id": "task_manage",
+          "name": "任务管理",
+          "description": "重试入库任务、立即执行扫描任务。",
+          "requires": ["view"]
+        },
+        {
+          "id": "agent_use",
+          "name": "使用入库 Agent",
+          "description": "配置模型、创建会话、批准或拒绝写入工具。",
+          "requires": ["view"]
+        },
+        {
+          "id": "mcp_execute",
+          "name": "调用 MCP",
+          "description": "通过 MCP 调用数据预览、入库和查询工具。",
+          "requires": ["view"]
+        }
+      ]
+    },
+    {
       "id": "resource",
       "name": "数据资源",
       "_source": "vega",

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: data-ingestion
+description: OpenBKN multi-source data ingestion, Agent, and MCP service
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,40 @@
+name: ci-data-ingestion
+
+on:
+  pull_request:
+    paths:
+      - 'adp/data-ingestion/**'
+      - 'bkn-safe/server/internal/seed/data/**'
+      - '.github/workflows/ci-data-ingestion.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-data-ingestion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: adp/data-ingestion
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            adp/data-ingestion/requirements.txt
+            adp/data-ingestion/test-requirements.txt
+      - run: pip install -r requirements.txt -r test-requirements.txt
+      - run: python -m compileall -q app tests
+      - run: python -m pytest -q
+        env:
+          DATA_INGESTION_AUTH_ENABLED: 'false'
+          STORAGE_BACKEND: local
+          AUTO_SCAN_ENABLED: 'false'
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts
